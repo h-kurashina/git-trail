@@ -242,11 +242,23 @@ restores the recorder's view. `trail edit --print` shows the buffer,
 
 ```bash
 trail open src/auth/service.ts
+trail open src/auth/service.ts --at 01K5V9W4YV7A3ZK6QH0M8R2B4C.1
 ```
 
-Opens a file of the worktree in `$VISUAL` / `$EDITOR`. `--at <checkpoint>`
-is reserved for opening the file as it was at a checkpoint; that needs
-snapshot storage and is not available yet.
+Opens a file of the worktree in `$VISUAL` / `$EDITOR`. With `--at`, the file
+is restored as it was when that checkpoint ended (its latest recorded version
+up to that point) into a temporary file and opened there; `--print` writes it
+to stdout instead. Checkpoint ids are shown by `trail history`.
+
+### Snapshots
+
+While recording, every observed version of a file is written into the Git
+object database as a blob (files over 8 MiB are recorded but not
+snapshotted). So that `git gc` keeps them, the recorder points
+`refs/trail/sessions/<session id>` at a small commit whose tree lists the
+session's blobs; the ref is refreshed at every commit boundary, every 25 new
+blobs and when the session ends. Nothing under `refs/heads` or `refs/tags`
+is touched, and deleting the ref only drops the snapshots, never the log.
 
 ## How it works
 

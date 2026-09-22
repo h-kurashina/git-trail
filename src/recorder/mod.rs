@@ -11,6 +11,7 @@
 
 pub mod checkpoint;
 pub mod metadata;
+pub mod snapshot;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -145,25 +146,32 @@ fn pair_renames(events: Vec<RawEvent>) -> Vec<RawEvent> {
     out
 }
 
-/// Git blob id of the file's content, `None` if it does not exist or is not a
-/// regular file (directories and sockets are not tracked).
+/// Content of a regular file or symlink (its target), `None` for anything
+/// else (missing, directory, socket, ...).
+pub fn read_content(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        Some(
+            std::fs::read_link(path)
+                .ok()?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+        )
+    } else if meta.is_file() {
+        std::fs::read(path).ok()
+    } else {
+        None
+    }
+}
+
+/// Git blob id of `data`.
 ///
 /// SHA-1 over the blob is not chosen for security but because it is the id
-/// `git hash-object` would produce, which a later snapshot phase can reuse.
-pub fn blob_hash(path: &Path, hash_kind: gix::hash::Kind) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    let data = if meta.file_type().is_symlink() {
-        std::fs::read_link(path)
-            .ok()?
-            .as_os_str()
-            .as_encoded_bytes()
-            .to_vec()
-    } else if meta.is_file() {
-        std::fs::read(path).ok()?
-    } else {
-        return None;
-    };
-    gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &data)
+/// `git hash-object` produces, so the same id addresses the snapshot in the
+/// object database.
+pub fn blob_id(data: &[u8], hash_kind: gix::hash::Kind) -> Option<String> {
+    gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, data)
         .ok()
         .map(|id| id.to_string())
 }
@@ -232,6 +240,7 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
     let header = build_header(repo, opts.base.as_deref(), started_at);
     let mut writer = SessionWriter::create(&store::session_dir(repo), &header)?;
     let mut tracker = Tracker::new(index_baseline(repo)?);
+    let mut snapshots = snapshot::SnapshotStore::new(repo.gix(), &header.session_id);
 
     let worktree = repo
         .gix()
@@ -350,11 +359,13 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
                 if let Ok(baseline) = index_baseline(repo) {
                     tracker.reset_baseline(baseline);
                 }
+                snapshots.protect()?;
             }
         }
         let mut paths: Vec<PathBuf> = pending.into_iter().collect();
         paths.sort();
         let mut batch: Vec<(PathBuf, Option<String>)> = Vec::new();
+        let mut contents: HashMap<PathBuf, Vec<u8>> = HashMap::new();
         for abs in paths {
             let Ok(rel) = abs.strip_prefix(&root) else {
                 continue;
@@ -368,18 +379,33 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
             {
                 continue;
             }
-            batch.push((rel.to_path_buf(), blob_hash(&abs, hash_kind)));
+            let content = read_content(&abs);
+            let hash = content.as_deref().and_then(|d| blob_id(d, hash_kind));
+            if let Some(data) = content {
+                contents.insert(rel.to_path_buf(), data);
+            }
+            batch.push((rel.to_path_buf(), hash));
         }
         for event in tracker.observe_batch(batch, ts) {
             writer.record(&event)?;
+            // Snapshot the new content so `trail open --at` can show it later.
+            if event.after_hash.is_some() {
+                if let Some(data) = contents.get(&event.path) {
+                    snapshots.store(data)?;
+                }
+            }
             if !opts.quiet {
                 println!("{}", describe(&event));
             }
+        }
+        if snapshots.needs_protection() {
+            snapshots.protect()?;
         }
     }
 
     let events = writer.events();
     let path = writer.path().to_path_buf();
+    let protected = snapshots.protect()?;
     writer.finish(Utc::now())?;
     if !opts.quiet {
         println!();
@@ -389,6 +415,14 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
             if events == 1 { "" } else { "s" },
             path.display()
         );
+        if protected.is_some() {
+            println!(
+                "Snapshots: {} blob{} kept under {}",
+                snapshots.blob_count(),
+                if snapshots.blob_count() == 1 { "" } else { "s" },
+                snapshot::ref_name(&header.session_id)
+            );
+        }
     }
     Ok(())
 }
