@@ -931,9 +931,11 @@ src/lib.rs
     std::fs::write(&file2, &again).unwrap();
     let out = trail_ok(&f.root, &["edit", "--from", file2.to_str().unwrap()]);
     assert!(out.contains("No changes."), "{out}");
-    let meta2 =
-        std::fs::read_to_string(f.root.join(".git/trail/metadata/checkpoints.json")).unwrap();
-    assert_eq!(meta2, serde_json::to_string_pretty(&meta).unwrap());
+    let meta2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(f.root.join(".git/trail/metadata/checkpoints.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta2, meta);
 }
 
 #[test]
