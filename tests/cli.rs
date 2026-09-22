@@ -800,3 +800,317 @@ fn sessions_survive_corrupt_and_truncated_logs() {
     let text = trail_ok(&f.root, &["sessions"]);
     assert!(text.contains("(open)"));
 }
+
+/// Writes a synthetic session with two checkpoints (40 s apart) so edit tests
+/// have stable ids: `synth.1` (src/lib.rs, src/one.rs) and `synth.2`
+/// (src/lib.rs, tests/t.rs).
+fn write_synthetic_session(root: &Path) {
+    let dir = root.join(".git/trail/worktrees/main/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = chrono::Utc::now();
+    let t = |secs: i64| (now + chrono::Duration::seconds(secs)).to_rfc3339();
+    let header = format!(
+        "{{\"kind\":\"session\",\"version\":1,\"session_id\":\"synth\",\"repository_root\":\"{r}\",\"worktree_id\":\"main\",\"worktree_path\":\"{r}\",\"branch\":\"feature\",\"base_commit\":null,\"start_head\":null,\"started_at\":\"{s}\"}}\n",
+        r = root.display(),
+        s = t(0)
+    );
+    let ev = |secs: i64, path: &str, kind: &str, before: &str, after: &str| {
+        format!(
+            "{{\"kind\":\"event\",\"timestamp\":\"{}\",\"path\":\"{path}\",\"type\":\"{kind}\",\"before_hash\":{before},\"after_hash\":{after}}}\n",
+            t(secs)
+        )
+    };
+    let text = header
+        + &ev(1, "src/lib.rs", "modified", "\"a\"", "\"b\"")
+        + &ev(2, "src/one.rs", "created", "null", "\"c\"")
+        + &ev(45, "src/lib.rs", "modified", "\"b\"", "\"d\"")
+        + &ev(46, "tests/t.rs", "created", "null", "\"e\"")
+        + &format!(
+            "{{\"kind\":\"end\",\"ended_at\":\"{}\",\"events\":4}}\n",
+            t(50)
+        );
+    std::fs::write(dir.join("session-synth.jsonl"), text).unwrap();
+}
+
+fn checkpoint_ids(json: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    json["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "checkpoint")
+        .map(|e| {
+            (
+                e["id"].as_str().unwrap().to_string(),
+                e["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["path"].as_str().unwrap().to_string())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn edit_print_renders_checkpoints_with_commit_context() {
+    let f = Fixture::with_feature("main");
+    write_synthetic_session(&f.root);
+    let text = trail_ok(&f.root, &["edit", "--print"]);
+    assert!(text.starts_with("# trail://feature\n"));
+    assert!(text.contains("# commit ") && text.contains("add feature module"));
+    assert!(
+        text.contains("[checkpoint:synth.1]\ntitle = \nhidden = false\n\nsrc/lib.rs\nsrc/one.rs\n")
+    );
+    assert!(
+        text.contains("[checkpoint:synth.2]\ntitle = \nhidden = false\n\nsrc/lib.rs\ntests/t.rs\n")
+    );
+}
+
+#[test]
+fn edit_from_file_updates_title_note_grouping_order_and_hidden() {
+    let f = Fixture::with_feature("main");
+    write_synthetic_session(&f.root);
+    let edited = "\
+# comments are fine
+[checkpoint:synth.2]
+title = Tests
+hidden = false
+note = written after lunch
+
+src/lib.rs
+tests/t.rs
+src/one.rs
+
+[checkpoint:synth.1]
+title = Foundation
+hidden = true
+
+src/lib.rs
+";
+    let file = f.root.join("edit.trail");
+    std::fs::write(&file, edited).unwrap();
+    let out = trail_ok(&f.root, &["edit", "--from", file.to_str().unwrap()]);
+    assert!(out.contains("2 title(s)"), "{out}");
+    assert!(out.contains("1 note(s)"), "{out}");
+    assert!(out.contains("1 visibility change(s)"), "{out}");
+    assert!(out.contains("1 file(s) regrouped"), "{out}");
+    assert!(out.contains("checkpoints reordered"), "{out}");
+
+    // Overlay is stored separately from the raw log, which is untouched.
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(f.root.join(".git/trail/metadata/checkpoints.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["version"], 1);
+    assert_eq!(meta["checkpoints"]["synth.1"]["title"], "Foundation");
+    assert_eq!(meta["checkpoints"]["synth.1"]["hidden"], true);
+    assert_eq!(
+        meta["checkpoints"]["synth.2"]["annotation"],
+        "written after lunch"
+    );
+    assert_eq!(meta["moves"][0]["path"], "src/one.rs");
+    assert_eq!(meta["order"], serde_json::json!(["synth.2", "synth.1"]));
+    let raw = std::fs::read_to_string(
+        f.root
+            .join(".git/trail/worktrees/main/sessions/session-synth.jsonl"),
+    )
+    .unwrap();
+    assert!(!raw.contains("Foundation"));
+    assert_eq!(raw.lines().count(), 6);
+
+    // The trail reflects the overlay: order swapped, file moved, title set.
+    let json = trail_json(&f.root, &["history"]);
+    let cps = checkpoint_ids(&json);
+    assert_eq!(cps[0].0, "synth.2");
+    assert_eq!(
+        cps[0].1,
+        vec!["src/one.rs", "src/lib.rs", "tests/t.rs"],
+        "changes stay chronological"
+    );
+    assert_eq!(cps[1].0, "synth.1");
+    assert_eq!(cps[1].1, vec!["src/lib.rs"]);
+    let hidden = json["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "synth.1")
+        .unwrap();
+    assert_eq!(hidden["hidden"], true);
+    assert_eq!(hidden["title"], "Foundation");
+    let text = trail_ok(&f.root, &["history"]);
+    assert!(text.contains("\"Tests\""));
+    assert!(text.contains("written after lunch"));
+    assert!(
+        !text.contains("Foundation"),
+        "hidden checkpoints are not rendered"
+    );
+
+    // Editing again starts from the overlaid state and is idempotent.
+    let again = trail_ok(&f.root, &["edit", "--print"]);
+    assert!(again.contains("[checkpoint:synth.2]\ntitle = Tests\nhidden = false\nnote = written after lunch\n\nsrc/one.rs\nsrc/lib.rs\ntests/t.rs\n"));
+    let file2 = f.root.join("edit2.trail");
+    std::fs::write(&file2, &again).unwrap();
+    let out = trail_ok(&f.root, &["edit", "--from", file2.to_str().unwrap()]);
+    assert!(out.contains("No changes."), "{out}");
+    let meta2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(f.root.join(".git/trail/metadata/checkpoints.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta2, meta);
+}
+
+#[test]
+fn edit_rejects_invalid_input_and_keeps_metadata_intact() {
+    let f = Fixture::with_feature("main");
+    write_synthetic_session(&f.root);
+    let good = f.root.join("good.trail");
+    std::fs::write(
+        &good,
+        "[checkpoint:synth.1]\ntitle = Keep me\n\nsrc/lib.rs\nsrc/one.rs\n[checkpoint:synth.2]\n\nsrc/lib.rs\ntests/t.rs\n",
+    )
+    .unwrap();
+    trail_ok(&f.root, &["edit", "--from", good.to_str().unwrap()]);
+    let meta_path = f.root.join(".git/trail/metadata/checkpoints.json");
+    let before = std::fs::read_to_string(&meta_path).unwrap();
+
+    let cases = [
+        ("src/lib.rs\n", "before the first"),
+        ("[checkpoint:synth.1]\ntitle = x\n[checkpoint:synth.2]\n", "was removed"),
+        ("[checkpoint:nope]\n", "unknown checkpoint"),
+        ("[checkpoint:synth.1]\ncolor = red\n", "unknown field"),
+        ("[commit:abc]\n", "cannot be edited"),
+        (
+            "[checkpoint:synth.1]\nsrc/lib.rs\nsrc/one.rs\nnew.rs\n[checkpoint:synth.2]\nsrc/lib.rs\ntests/t.rs\n",
+            "invented",
+        ),
+        (
+            "[checkpoint:synth.1]\nsrc/lib.rs\nsrc/one.rs\nsrc/lib.rs\n[checkpoint:synth.2]\ntests/t.rs\n",
+            "listed twice",
+        ),
+    ];
+    for (text, expected) in cases {
+        let bad = f.root.join("bad.trail");
+        std::fs::write(&bad, text).unwrap();
+        let out = trail(&f.root, &["edit", "--from", bad.to_str().unwrap()]);
+        assert!(!out.ok, "{text:?} should fail");
+        assert!(out.stderr.contains(expected), "{text:?}: {}", out.stderr);
+        assert!(out.stderr.contains("no changes were applied"));
+        assert_eq!(
+            std::fs::read_to_string(&meta_path).unwrap(),
+            before,
+            "{text:?} changed metadata"
+        );
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(meta_path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "checkpoints.json")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "atomic write leaves no temp files: {leftovers:?}"
+    );
+}
+
+#[cfg(unix)]
+fn fake_editor(dir: &Path, script_body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("fake-editor.sh");
+    std::fs::write(&script, format!("#!/bin/sh\n{script_body}\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_launches_visual_then_editor_and_applies_the_saved_buffer() {
+    let f = Fixture::with_feature("main");
+    write_synthetic_session(&f.root);
+    // The "editor" rewrites the title of synth.1 in place.
+    let script = fake_editor(
+        &f.root,
+        "sed -i.bak 's/^title = $/title = From the editor/' \"$1\" && rm -f \"$1.bak\"",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("edit")
+        .current_dir(&f.root)
+        .env("VISUAL", &script)
+        .env("EDITOR", "/nonexistent/editor")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("2 title(s)"));
+    let json = trail_json(&f.root, &["history"]);
+    let titles: Vec<&str> = json["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "checkpoint")
+        .map(|e| e["title"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(titles, vec!["From the editor", "From the editor"]);
+
+    // A failing editor applies nothing.
+    let failing = fake_editor(&f.root, "exit 3");
+    let out = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("edit")
+        .current_dir(&f.root)
+        .env_remove("VISUAL")
+        .env("EDITOR", &failing)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("editor failed"));
+
+    // No editor at all is a clear error. PATH holds only git so the
+    // platform fallback (vi) cannot be found either.
+    let git_path =
+        String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout).unwrap();
+    let bin = f.root.join("only-git");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(git_path.trim(), bin.join("git")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("edit")
+        .current_dir(&f.root)
+        .env_remove("VISUAL")
+        .env_remove("EDITOR")
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no editor configured"));
+}
+
+#[cfg(unix)]
+#[test]
+fn open_launches_the_editor_on_the_worktree_file() {
+    let f = Fixture::with_feature("main");
+    let log = f.root.join("opened.log");
+    let script = fake_editor(&f.root, &format!("echo \"$1\" >> {}", log.display()));
+    let out = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .args(["open", "lib.rs"])
+        .current_dir(f.root.join("src"))
+        .env("EDITOR", &script)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().trim(),
+        f.root.join("src/lib.rs").to_str().unwrap()
+    );
+
+    let out = trail(&f.root, &["open", "missing.rs"]);
+    assert!(!out.ok);
+    let out = trail(&f.root, &["open", "src/lib.rs", "--at", "synth.1"]);
+    assert!(!out.ok);
+    assert!(out.stderr.contains("not available yet"));
+}

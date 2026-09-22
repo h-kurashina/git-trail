@@ -22,8 +22,10 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 notify = "8"
 ulid = "1"
+shell-words = "1"
 ctrlc = "3"
 gix = { version = "0.87", default-features = false, features = ["revision", "blob-diff", "sha1", "comfort", "excludes"] }
 
 [dev-dependencies]
 tempfile = "3"
+chrono = "0.4"
