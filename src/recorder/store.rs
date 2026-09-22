@@ -1,7 +1,7 @@
 //! On-disk format of recorded sessions: append-only JSONL, one file per session.
 //!
-//! Sessions live in `<common_dir>/trail/worktrees/<worktree id>/` so they
-//! survive `git worktree remove`. The first line is a `session` header, every
+//! Sessions live in `<common_dir>/trail/worktrees/<worktree id>/sessions/` so
+//! they survive `git worktree remove`. The first line is a `session` header, every
 //! change is an `event` line, and a graceful stop appends an `end` line.
 //! A crash simply leaves the file without an `end` line; every earlier line is
 //! still valid.
@@ -18,34 +18,47 @@ use crate::git::repository::Repo;
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Everything needed to understand a session after its worktree is gone.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionHeader {
     pub version: u32,
     pub session_id: String,
+    /// Root of the main worktree (the one that owns `.git`).
+    pub repository_root: PathBuf,
     pub worktree_id: String,
     pub worktree_path: PathBuf,
-    pub branch: String,
+    /// `None` on a detached HEAD.
+    pub branch: Option<String>,
+    /// Merge base with the detected base branch, if one could be found.
+    pub base_commit: Option<String>,
     /// HEAD when the session started.
-    pub base_commit: String,
+    pub start_head: Option<String>,
     pub started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RecordedKind {
-    Added,
+pub enum RawEventKind {
+    Created,
     Modified,
     Deleted,
+    Renamed,
 }
 
-/// One observed change. Hashes are git blob ids of the content before and
-/// after, so a later phase can turn a session into per-checkpoint diffs.
+/// One observed change, exactly as the recorder saw it.
+///
+/// Hashes are git blob ids of the content before and after, so a later phase
+/// can store snapshots in the object database and rebuild per-checkpoint diffs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RecordedEvent {
-    pub ts: DateTime<Utc>,
-    #[serde(rename = "type")]
-    pub kind: RecordedKind,
+pub struct RawEvent {
+    pub timestamp: DateTime<Utc>,
     pub path: PathBuf,
+    /// Serialized as `type`: `kind` is the record tag.
+    #[serde(rename = "type")]
+    pub kind: RawEventKind,
+    /// Previous path for `Renamed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_path: Option<PathBuf>,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
 }
@@ -60,25 +73,33 @@ pub struct SessionEnd {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record {
     Session(SessionHeader),
-    Event(RecordedEvent),
+    Event(RawEvent),
     End(SessionEnd),
 }
 
 /// Directory holding this worktree's sessions.
 pub fn session_dir(repo: &Repo) -> PathBuf {
-    let id = repo.worktree.id.clone().unwrap_or_else(|| "main".into());
     repo.worktree
         .common_dir
         .join("trail")
         .join("worktrees")
-        .join(id)
+        .join(worktree_id(repo))
+        .join("sessions")
 }
 
+/// Identifier of the worktree inside the trail store: the linked worktree's
+/// id under `.git/worktrees/`, or `main` for the main worktree.
+pub fn worktree_id(repo: &Repo) -> String {
+    repo.worktree.id.clone().unwrap_or_else(|| "main".into())
+}
+
+/// Sortable, human readable id: UTC time plus a few bits of the pid so two
+/// recorders started in the same second do not collide.
 pub fn new_session_id(now: DateTime<Utc>) -> String {
     format!(
-        "{}-{:04x}",
-        now.format("%Y%m%dT%H%M%SZ"),
-        std::process::id() & 0xffff
+        "{}-{:03x}",
+        now.format("%Y%m%d-%H%M%S"),
+        std::process::id() & 0xfff
     )
 }
 
@@ -116,7 +137,7 @@ impl SessionWriter {
         self.events
     }
 
-    pub fn record(&mut self, event: &RecordedEvent) -> Result<()> {
+    pub fn record(&mut self, event: &RawEvent) -> Result<()> {
         self.events += 1;
         self.write(&Record::Event(event.clone()))
     }
@@ -164,17 +185,20 @@ mod tests {
         let header = SessionHeader {
             version: FORMAT_VERSION,
             session_id: "s1".into(),
+            repository_root: PathBuf::from("/repo"),
             worktree_id: "main".into(),
             worktree_path: PathBuf::from("/repo"),
-            branch: "feature".into(),
-            base_commit: "abc".into(),
+            branch: Some("feature".into()),
+            base_commit: Some("abc".into()),
+            start_head: Some("def".into()),
             started_at: Utc::now(),
         };
         let mut w = SessionWriter::create(dir.path(), &header).unwrap();
-        let event = RecordedEvent {
-            ts: Utc::now(),
-            kind: RecordedKind::Modified,
+        let event = RawEvent {
+            timestamp: Utc::now(),
+            kind: RawEventKind::Modified,
             path: PathBuf::from("src/a.rs"),
+            from_path: None,
             before_hash: Some("1".into()),
             after_hash: Some("2".into()),
         };
@@ -187,11 +211,16 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap()
-            .write_all(b"{\"kind\":\"event\",\"ts\":")
+            .write_all(b"{\"kind\":\"event\",\"timestamp\":")
             .unwrap();
 
         let records = read_session(&path).unwrap();
-        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records.len(),
+            3,
+            "{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
         assert_eq!(records[0], Record::Session(header));
         assert_eq!(records[1], Record::Event(event));
         assert!(matches!(
