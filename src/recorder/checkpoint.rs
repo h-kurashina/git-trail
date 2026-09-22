@@ -29,6 +29,29 @@ pub enum ChangeKind {
     Renamed,
 }
 
+impl ChangeKind {
+    /// One-character marker used in file lists: `+ ~ - >`.
+    pub fn mark(self) -> &'static str {
+        match self {
+            ChangeKind::Created => "+",
+            ChangeKind::Modified => "~",
+            ChangeKind::Deleted => "-",
+            ChangeKind::Renamed => ">",
+        }
+    }
+}
+
+impl From<RawEventKind> for ChangeKind {
+    fn from(kind: RawEventKind) -> Self {
+        match kind {
+            RawEventKind::Created => ChangeKind::Created,
+            RawEventKind::Modified => ChangeKind::Modified,
+            RawEventKind::Deleted => ChangeKind::Deleted,
+            RawEventKind::Renamed => ChangeKind::Renamed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileChange {
     /// Id of the checkpoint the recorder put this change in. Stays the same
@@ -105,12 +128,7 @@ fn change_from(event: &RawEvent) -> FileChange {
     FileChange {
         origin: String::new(), // filled in when the change joins a checkpoint
         path: event.path.clone(),
-        kind: match event.kind {
-            RawEventKind::Created => ChangeKind::Created,
-            RawEventKind::Modified => ChangeKind::Modified,
-            RawEventKind::Deleted => ChangeKind::Deleted,
-            RawEventKind::Renamed => ChangeKind::Renamed,
-        },
+        kind: event.kind.into(),
         from_path: event.from_path.clone(),
         before_hash: event.before_hash.clone(),
         after_hash: event.after_hash.clone(),
@@ -158,57 +176,74 @@ fn debounce(events: &[&RawEvent]) -> Vec<FileChange> {
     out
 }
 
-/// Build the checkpoints of one session from its records, in order.
-pub fn build_checkpoints(session_id: &str, records: &[Record]) -> Vec<Checkpoint> {
-    let mut checkpoints: Vec<Checkpoint> = Vec::new();
-    let mut open: Option<Checkpoint> = None;
-    let mut next_index = 1;
-    let close = |open: &mut Option<Checkpoint>, checkpoints: &mut Vec<Checkpoint>| {
-        if let Some(cp) = open.take() {
-            if let Some(cp) = cp.finish() {
-                checkpoints.push(cp);
-            }
-        }
-    };
+/// Stage 2: group debounced changes into checkpoints by time gap.
+struct Grouper<'a> {
+    session_id: &'a str,
+    open: Option<Checkpoint>,
+    done: Vec<Checkpoint>,
+    next_index: usize,
+}
 
-    // Runs of consecutive events; a commit or end record is a hard boundary.
-    let mut run: Vec<&RawEvent> = Vec::new();
-    let flush_run = |run: &mut Vec<&RawEvent>,
-                     open: &mut Option<Checkpoint>,
-                     checkpoints: &mut Vec<Checkpoint>,
-                     next_index: &mut usize| {
+impl<'a> Grouper<'a> {
+    fn new(session_id: &'a str) -> Self {
+        Grouper {
+            session_id,
+            open: None,
+            done: Vec::new(),
+            next_index: 1,
+        }
+    }
+
+    /// Close the open checkpoint (a commit or end record is a hard boundary).
+    fn close(&mut self) {
+        if let Some(cp) = self.open.take().and_then(Checkpoint::finish) {
+            self.done.push(cp);
+        }
+    }
+
+    fn push(&mut self, change: FileChange) {
+        let starts_new = match &self.open {
+            Some(cp) => change.first_seen - cp.ended_at > WINDOW,
+            None => true,
+        };
+        if starts_new {
+            self.close();
+            self.open = Some(Checkpoint::new(self.session_id, self.next_index, &change));
+            self.next_index += 1;
+        }
+        self.open.as_mut().expect("opened above").absorb(change);
+    }
+
+    /// Debounce a run of consecutive events and push the result.
+    fn push_run(&mut self, run: &mut Vec<&RawEvent>) {
         for change in debounce(run) {
-            let starts_new = match open {
-                Some(cp) => change.first_seen - cp.ended_at > WINDOW,
-                None => true,
-            };
-            if starts_new {
-                if let Some(cp) = open.take() {
-                    if let Some(cp) = cp.finish() {
-                        checkpoints.push(cp);
-                    }
-                }
-                *open = Some(Checkpoint::new(session_id, *next_index, &change));
-                *next_index += 1;
-            }
-            open.as_mut().expect("opened above").absorb(change);
+            self.push(change);
         }
         run.clear();
-    };
+    }
 
+    fn finish(mut self) -> Vec<Checkpoint> {
+        self.close();
+        self.done
+    }
+}
+
+/// Build the checkpoints of one session from its records, in order.
+pub fn build_checkpoints(session_id: &str, records: &[Record]) -> Vec<Checkpoint> {
+    let mut grouper = Grouper::new(session_id);
+    let mut run: Vec<&RawEvent> = Vec::new();
     for record in records {
         match record {
             Record::Event(event) => run.push(event),
             Record::Commit { .. } | Record::End(_) => {
-                flush_run(&mut run, &mut open, &mut checkpoints, &mut next_index);
-                close(&mut open, &mut checkpoints);
+                grouper.push_run(&mut run);
+                grouper.close();
             }
             Record::Session(_) => {}
         }
     }
-    flush_run(&mut run, &mut open, &mut checkpoints, &mut next_index);
-    close(&mut open, &mut checkpoints);
-    checkpoints
+    grouper.push_run(&mut run);
+    grouper.finish()
 }
 
 #[cfg(test)]

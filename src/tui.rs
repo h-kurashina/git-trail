@@ -16,9 +16,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use crate::display::plural;
 use crate::error::{Result, TrailError};
+use crate::git::diff::LineStats;
 use crate::git::repository::Repo;
-use crate::review::{self, ReviewCheckpoint, ReviewReport};
+use crate::review::{self, ReviewCheckpoint, ReviewFile, ReviewReport};
 use crate::trail::Trail;
 
 /// Terminals at least this wide get the three-pane layout.
@@ -83,7 +85,7 @@ impl App {
         self.report.checkpoints.get(self.checkpoint)
     }
 
-    pub fn current_file(&self) -> Option<&review::ReviewFile> {
+    pub fn current_file(&self) -> Option<&ReviewFile> {
         self.current_checkpoint()?.files.get(self.file)
     }
 
@@ -226,25 +228,7 @@ pub fn run(repo: &Repo, trail: &Trail, report: ReviewReport, cwd: &Path) -> Resu
         let file = cp.files.iter().find(|f| f.path == path).ok_or_else(|| {
             TrailError::InvalidSelection(format!("{} is not in the checkpoint", path.display()))
         })?;
-        let before = file.before_hash.as_deref().and_then(|h| {
-            crate::recorder::snapshot::read_blob(repo.gix(), h)
-                .ok()
-                .flatten()
-        });
-        let after = file.after_hash.as_deref().and_then(|h| {
-            crate::recorder::snapshot::read_blob(repo.gix(), h)
-                .ok()
-                .flatten()
-        });
-        if !file.snapshot {
-            return Ok(String::new());
-        }
-        Ok(review::unified_diff(
-            &file.path,
-            file.from_path.as_deref(),
-            before.as_deref(),
-            after.as_deref(),
-        ))
+        Ok(review::diff_text(repo, file))
     };
 
     let mut terminal = ratatui::init();
@@ -340,23 +324,15 @@ fn draw_checkpoints(frame: &mut Frame, area: Rect, app: &App) {
         .checkpoints
         .iter()
         .map(|cp| {
-            let name = cp
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("Checkpoint {}", cp.number));
-            let files = format!(
-                "{} file{}",
-                cp.files.len(),
-                if cp.files.len() == 1 { "" } else { "s" }
-            );
+            let files = format!("{} file{}", cp.files.len(), plural(cp.files.len()));
             ListItem::new(vec![
-                Line::from(format!("[{}] {name}", cp.number)),
+                Line::from(format!("[{}] {}", cp.number, cp.display_title())),
                 Line::from(Span::styled(
                     format!(
                         "    {} - {}  {files}  {}",
                         cp.started_at.with_timezone(&chrono::Local).format("%H:%M"),
                         cp.ended_at.with_timezone(&chrono::Local).format("%H:%M"),
-                        plus_minus(cp.stats.additions, cp.stats.deletions)
+                        cp.stats
                     ),
                     Style::default().fg(Color::DarkGray),
                 )),
@@ -400,21 +376,15 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
             cp.files
                 .iter()
                 .map(|f| {
-                    let mark = match f.kind {
-                        crate::recorder::checkpoint::ChangeKind::Created => "+",
-                        crate::recorder::checkpoint::ChangeKind::Modified => "~",
-                        crate::recorder::checkpoint::ChangeKind::Deleted => "-",
-                        crate::recorder::checkpoint::ChangeKind::Renamed => ">",
-                    };
                     let stat = if !f.snapshot {
                         "no snapshot".to_string()
                     } else if f.binary {
                         "binary".to_string()
                     } else {
-                        plus_minus(f.additions.unwrap_or(0), f.deletions.unwrap_or(0))
+                        LineStats::from_counts(f.additions, f.deletions).to_string()
                     };
                     ListItem::new(Line::from(vec![
-                        Span::raw(format!("{mark} {}  ", f.path.display())),
+                        Span::raw(format!("{} {}  ", f.kind.mark(), f.path.display())),
                         Span::styled(stat, Style::default().fg(Color::DarkGray)),
                     ]))
                 })
@@ -502,20 +472,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, wide: bool) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn plus_minus(additions: u64, deletions: u64) -> String {
-    match (additions, deletions) {
-        (0, 0) => "±0".into(),
-        (a, 0) => format!("+{a}"),
-        (0, d) => format!("-{d}"),
-        (a, d) => format!("+{a} -{d}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::diff::LineStats;
-    use crate::review::ReviewFile;
 
     fn file(path: &str) -> ReviewFile {
         ReviewFile {

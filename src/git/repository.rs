@@ -6,6 +6,7 @@ use gix::bstr::ByteSlice;
 use serde::Serialize;
 
 use crate::error::{Result, TrailError};
+use crate::git::normalize_path;
 use crate::git::worktree::WorktreeInfo;
 
 /// State of HEAD as far as trail cares.
@@ -17,6 +18,14 @@ pub enum HeadState {
 }
 
 impl HeadState {
+    /// Branch name, `None` on a detached HEAD.
+    pub fn branch_name(&self) -> Option<&str> {
+        match self {
+            HeadState::Branch { name } => Some(name),
+            HeadState::Detached { .. } => None,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             HeadState::Branch { name } => name.clone(),
@@ -51,7 +60,6 @@ pub struct Repo {
     pub name: String,
     pub worktree: WorktreeInfo,
     pub head: HeadState,
-    #[allow(dead_code)]
     pub head_id: gix::ObjectId,
     pub is_shallow: bool,
 }
@@ -205,13 +213,13 @@ impl Repo {
         } else {
             cwd.join(file)
         };
-        let absolute = lexically_normalize(&absolute);
-        let root = lexically_normalize(self.workdir());
+        let absolute = normalize_path(&absolute);
+        let root = normalize_path(self.workdir());
         match absolute.strip_prefix(&root) {
             Ok(rel) => Ok(rel.to_path_buf()),
             // Outside the worktree as given: assume the user typed a path
             // relative to the repository root.
-            Err(_) => Ok(lexically_normalize(file)),
+            Err(_) => Ok(normalize_path(file)),
         }
     }
 }
@@ -234,19 +242,4 @@ fn repo_name(common_dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().trim_end_matches(".git").to_string())
         .unwrap_or_else(|| "repository".into())
-}
-
-/// Resolve `.` and `..` without touching the filesystem (symlinks are left alone).
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }

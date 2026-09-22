@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::error::Result;
+use crate::error::{Result, TrailError};
 use crate::git::baseline::{Baseline, SinceSpec};
-use crate::git::diff::{self, ChangeKind, DiffTarget, FileStat, LineStats, StatusEntry};
+use crate::git::diff::{self, ChangeKind, FileStat, LineStats, StatusEntry};
 use crate::git::history;
 use crate::git::repository::{BaseRef, Repo};
 use crate::recorder::checkpoint::{build_checkpoints, Checkpoint};
 use crate::recorder::metadata::Metadata;
+use crate::recorder::snapshot;
 use crate::recorder::store::{self, SessionFile};
 use crate::trail::event::{Confidence, EventSource, TrailEvent, TrailEventType};
 use crate::trail::{
@@ -29,6 +30,12 @@ pub enum Scope {
     Detailed,
 }
 
+/// Context for commands that always look at the whole branch (no `--since`).
+fn base_context(repo: &Repo, base: &BaseRef) -> Result<RepositoryContext> {
+    let baseline = repo.resolve_baseline(&SinceSpec::Base, base)?;
+    Ok(context(repo, base, &baseline))
+}
+
 fn context(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> RepositoryContext {
     RepositoryContext {
         name: repo.name.clone(),
@@ -41,28 +48,22 @@ fn context(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> RepositoryContex
     }
 }
 
-/// Line stats of merge-base..working tree, including untracked files.
-/// This is the "what will end up in the PR" view.
+/// Line stats of `rev`..working tree, including untracked files (git leaves
+/// them out of a diff, so they are counted as pure additions).
+fn stats_since(repo: &Repo, rev: &str, entries: &[StatusEntry]) -> Result<Vec<FileStat>> {
+    let mut stats = diff::numstat(repo.workdir(), rev, &[])?;
+    stats.extend(diff::untracked_stats(repo.workdir(), entries));
+    Ok(stats)
+}
+
+/// Line stats of merge-base..working tree: the "what will end up in the PR" view.
 fn stats_since_base(repo: &Repo, base: &BaseRef, entries: &[StatusEntry]) -> Result<Vec<FileStat>> {
-    let rev = base.merge_base.to_string();
-    let mut stats = diff::numstat(repo.workdir(), DiffTarget::Revision(&rev), &[])?;
-    stats.extend(diff::untracked_stats(repo.workdir(), entries));
-    Ok(stats)
+    stats_since(repo, &base.merge_base.to_string(), entries)
 }
 
-/// Line stats of HEAD..working tree, including untracked files.
+/// Line stats of HEAD..working tree.
 fn stats_since_head(repo: &Repo, entries: &[StatusEntry]) -> Result<Vec<FileStat>> {
-    let mut stats = diff::numstat(repo.workdir(), DiffTarget::Revision("HEAD"), &[])?;
-    stats.extend(diff::untracked_stats(repo.workdir(), entries));
-    Ok(stats)
-}
-
-fn total(stats: &[FileStat]) -> LineStats {
-    let mut total = LineStats::default();
-    for s in stats {
-        total.add(s);
-    }
-    total
+    stats_since(repo, "HEAD", entries)
 }
 
 fn mtime(path: &Path) -> Option<DateTime<Utc>> {
@@ -127,10 +128,9 @@ pub fn build_trail(
                 EventSource::Filesystem,
             )
         };
-        let stats = stat_by_path.get(entry.path.as_path()).map(|s| LineStats {
-            additions: s.additions.unwrap_or(0),
-            deletions: s.deletions.unwrap_or(0),
-        });
+        let stats = stat_by_path
+            .get(entry.path.as_path())
+            .map(|s| LineStats::from_counts(s.additions, s.deletions));
         let staged = if entry.untracked {
             None
         } else {
@@ -233,11 +233,12 @@ pub fn build_trail(
 
     apply_order(&mut events, &metadata.order);
 
+    let base_total = LineStats::sum(&base_stats);
     let summary = TrailSummary {
         changes: events.iter().filter(|e| e.is_change()).count(),
         files_changed: base_stats.len(),
-        additions: total(&base_stats).additions,
-        deletions: total(&base_stats).deletions,
+        additions: base_total.additions,
+        deletions: base_total.deletions,
     };
 
     Ok(Trail {
@@ -259,16 +260,13 @@ fn commit_time(repo: &Repo, id: gix::ObjectId) -> Option<DateTime<Utc>> {
 /// from dragging in an unrelated trail.
 fn sessions_for(repo: &Repo) -> Result<Vec<SessionFile>> {
     let worktree_id = store::worktree_id(repo);
-    let branch = match &repo.head {
-        crate::git::repository::HeadState::Branch { name } => Some(name.clone()),
-        crate::git::repository::HeadState::Detached { .. } => None,
-    };
+    let branch = repo.head.branch_name();
     Ok(store::list_sessions(&repo.worktree.common_dir)?
         .into_iter()
         .filter(|s| {
             s.header.worktree_id == worktree_id
                 || (branch.is_some()
-                    && s.header.branch == branch
+                    && s.header.branch.as_deref() == branch
                     && s.header
                         .start_head
                         .as_deref()
@@ -368,7 +366,7 @@ pub fn build_sessions(repo: &Repo) -> Result<SessionsReport> {
             checkpoints: build_checkpoints(&s.header.session_id, &s.records).len(),
             last_activity: s.last_activity(),
             worktree_exists: s.header.worktree_path.is_dir(),
-            snapshots: crate::recorder::snapshot::has_snapshots(repo.gix(), &s.header.session_id),
+            snapshots: snapshot::has_snapshots(repo.gix(), &s.header.session_id),
             session_id: s.header.session_id,
             worktree_id: s.header.worktree_id,
             worktree_path: s.header.worktree_path,
@@ -390,9 +388,7 @@ pub fn build_sessions(repo: &Repo) -> Result<SessionsReport> {
 pub fn build_changes(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> Result<ChangesReport> {
     let entries = diff::status(repo.workdir())?;
     let commits = history::commits_between(repo.gix(), repo.head_id, baseline.start)?;
-    let start = baseline.start.to_string();
-    let mut stats = diff::numstat(repo.workdir(), DiffTarget::Revision(&start), &[])?;
-    stats.extend(diff::untracked_stats(repo.workdir(), &entries));
+    let stats = stats_since(repo, &baseline.start.to_string(), &entries)?;
     let baseline_tree = repo
         .gix()
         .find_commit(baseline.start)
@@ -431,17 +427,17 @@ pub fn build_changes(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> Result
         commits,
         checkpoints: checkpoints.iter().filter(|(cp, _)| !cp.hidden).count(),
         counts: kind_counts(&entries),
-        stats: total(&files.iter().map(|f| f.stat.clone()).collect::<Vec<_>>()),
+        stats: LineStats::sum(files.iter().map(|f| &f.stat)),
         files,
     })
 }
 
 pub fn build_status(repo: &Repo, base: &BaseRef) -> Result<StatusReport> {
     let entries = diff::status(repo.workdir())?;
-    let stats = total(&stats_since_head(repo, &entries)?);
+    let stats = LineStats::sum(&stats_since_head(repo, &entries)?);
     let commits_ahead = history::commits_between(repo.gix(), repo.head_id, base.merge_base)?.len();
     Ok(StatusReport {
-        repository: context(repo, base, &repo.resolve_baseline(&SinceSpec::Base, base)?),
+        repository: base_context(repo, base)?,
         counts: kind_counts(&entries),
         stats,
         commits_ahead,
@@ -467,7 +463,7 @@ pub fn build_diff(repo: &Repo, base: &BaseRef) -> Result<DiffReport> {
         .into_iter()
         .map(|(directory, mut files)| {
             files.sort_by(|a, b| a.path.cmp(&b.path));
-            let stats = total(&files);
+            let stats = LineStats::sum(&files);
             DiffGroup {
                 directory,
                 files,
@@ -477,9 +473,9 @@ pub fn build_diff(repo: &Repo, base: &BaseRef) -> Result<DiffReport> {
         .collect();
 
     Ok(DiffReport {
-        repository: context(repo, base, &repo.resolve_baseline(&SinceSpec::Base, base)?),
+        repository: base_context(repo, base)?,
         files_changed: stats.len(),
-        stats: total(&stats),
+        stats: LineStats::sum(&stats),
         groups,
     })
 }
@@ -502,7 +498,7 @@ pub fn build_inspect(
     let commits = history::file_commits(repo.workdir(), &rel, 20)?;
     let tracked = !commits.is_empty() || status.as_ref().map(|s| !s.untracked).unwrap_or(false);
     if !tracked && !exists {
-        return Err(crate::error::TrailError::FileNotFound(rel));
+        return Err(TrailError::FileNotFound(rel));
     }
 
     let pick = |stats: Vec<FileStat>| stats.into_iter().find(|s| s.path == rel);
@@ -520,16 +516,8 @@ pub fn build_inspect(
     } else {
         let merge_base = base.merge_base.to_string();
         (
-            pick(diff::numstat(
-                repo.workdir(),
-                DiffTarget::Revision("HEAD"),
-                &[&rel],
-            )?),
-            pick(diff::numstat(
-                repo.workdir(),
-                DiffTarget::Revision(&merge_base),
-                &[&rel],
-            )?),
+            pick(diff::numstat(repo.workdir(), "HEAD", &[&rel])?),
+            pick(diff::numstat(repo.workdir(), &merge_base, &[&rel])?),
         )
     };
 
@@ -547,7 +535,7 @@ pub fn build_inspect(
         .collect();
 
     Ok(InspectReport {
-        repository: context(repo, base, &repo.resolve_baseline(&SinceSpec::Base, base)?),
+        repository: base_context(repo, base)?,
         last_modified: if exists { mtime(&abs) } else { None },
         path: rel,
         tracked,

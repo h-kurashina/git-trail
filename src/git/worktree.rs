@@ -5,11 +5,12 @@
 //! rest of the program never has to care whether it runs in the main worktree
 //! or a linked one.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Serialize;
 
 use crate::error::{Result, TrailError};
+use crate::git::normalize_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,7 +52,7 @@ impl WorktreeInfo {
         };
         let id = worktree.id().map(|id| id.to_string());
         let git_dir = repo.git_dir().to_path_buf();
-        let common_dir = normalize(repo.common_dir());
+        let common_dir = normalize_path(repo.common_dir());
 
         let sibling_count = match repo.worktrees() {
             Ok(list) => {
@@ -76,19 +77,4 @@ impl WorktreeInfo {
             sibling_count,
         })
     }
-}
-
-/// Collapse `..` segments produced by gix when it resolves `commondir` files.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }

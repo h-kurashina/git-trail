@@ -52,6 +52,15 @@ pub struct ReviewCheckpoint {
     pub stats: LineStats,
 }
 
+impl ReviewCheckpoint {
+    /// The human title, or "Checkpoint N" when none was given.
+    pub fn display_title(&self) -> String {
+        self.title
+            .clone()
+            .unwrap_or_else(|| format!("Checkpoint {}", self.number))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewReport {
     pub repository: RepositoryContext,
@@ -260,27 +269,38 @@ pub fn build(repo: &Repo, trail: &Trail) -> ReviewReport {
     }
 }
 
+/// Unified diff text of one reviewed file, rebuilt from its snapshots.
+/// Empty when a side is missing from the object database.
+pub fn diff_text(repo: &Repo, file: &ReviewFile) -> String {
+    if !file.snapshot {
+        return String::new();
+    }
+    let before = side(repo, file.before_hash.as_deref()).unwrap_or(None);
+    let after = side(repo, file.after_hash.as_deref()).unwrap_or(None);
+    unified_diff(
+        &file.path,
+        file.from_path.as_deref(),
+        before.as_deref(),
+        after.as_deref(),
+    )
+}
+
 /// Find a checkpoint by review number or id.
 pub fn select<'a>(report: &'a ReviewReport, selector: &str) -> Result<&'a ReviewCheckpoint> {
-    if let Ok(n) = selector.parse::<usize>() {
-        return report
-            .checkpoints
-            .iter()
-            .find(|c| c.number == n)
-            .ok_or_else(|| {
-                TrailError::InvalidSelection(format!(
-                    "checkpoint {n} does not exist; `trail review` lists 1..{}",
-                    report.checkpoints.len()
-                ))
-            });
-    }
-    report
-        .checkpoints
-        .iter()
-        .find(|c| c.id == selector)
-        .ok_or_else(|| {
-            TrailError::InvalidSelection(format!("no checkpoint {selector} in this review"))
+    let number = selector.parse::<usize>().ok();
+    let found = report.checkpoints.iter().find(|c| match number {
+        Some(n) => c.number == n,
+        None => c.id == selector,
+    });
+    found.ok_or_else(|| {
+        TrailError::InvalidSelection(match number {
+            Some(n) => format!(
+                "checkpoint {n} does not exist; `trail review` lists 1..{}",
+                report.checkpoints.len()
+            ),
+            None => format!("no checkpoint {selector} in this review"),
         })
+    })
 }
 
 /// Diff of one file within one checkpoint.
@@ -303,18 +323,7 @@ pub fn file_diff(
             ))
         })?
         .clone();
-    let diff = if !file.snapshot {
-        String::new()
-    } else {
-        let before = side(repo, file.before_hash.as_deref()).unwrap_or(None);
-        let after = side(repo, file.after_hash.as_deref()).unwrap_or(None);
-        unified_diff(
-            &file.path,
-            file.from_path.as_deref(),
-            before.as_deref(),
-            after.as_deref(),
-        )
-    };
+    let diff = diff_text(repo, &file);
     Ok(FileDiffReport {
         repository: report.repository.clone(),
         checkpoint: checkpoint.clone(),
