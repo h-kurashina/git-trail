@@ -12,6 +12,7 @@ mod git;
 mod recorder;
 mod review;
 mod trail;
+mod tui;
 
 fn main() {
     if let Err(err) = cli::run() {

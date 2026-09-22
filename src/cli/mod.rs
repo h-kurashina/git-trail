@@ -45,6 +45,9 @@ pub enum Command {
         /// Open the file as it was at the end of the checkpoint in $VISUAL / $EDITOR
         #[arg(long)]
         open: bool,
+        /// Browse checkpoints, files and diffs interactively
+        #[arg(short = 'i', long)]
+        interactive: bool,
     },
     /// Show the development trail in detail (commits, reflog, working tree)
     History {
