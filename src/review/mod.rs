@@ -765,18 +765,11 @@ pub enum Selected<'a> {
 /// `section.number` label or id.
 pub fn select<'a>(review: &'a WorktreeReview, selector: &str) -> Result<Selected<'a>> {
     let selector = selector.trim();
-    if let Ok(n) = selector.parse::<usize>() {
-        return review
-            .sections
-            .iter()
-            .find(|s| s.number() == n)
-            .map(Selected::Section)
-            .ok_or_else(|| {
-                TrailError::InvalidSelection(format!(
-                    "section {n} does not exist; `trail review` lists 1..{}",
-                    review.sections.len()
-                ))
-            });
+    let number = selector.parse::<usize>().ok();
+    if let Some(n) = number {
+        if let Some(s) = review.sections.iter().find(|s| s.number() == n) {
+            return Ok(Selected::Section(s));
+        }
     }
     if let Some(cp) = review
         .checkpoints
@@ -800,6 +793,13 @@ pub fn select<'a>(review: &'a WorktreeReview, selector: &str) -> Result<Selected
             }
             _ => {}
         }
+    }
+    // A short number that matched nothing was meant as a section.
+    if number.is_some_and(|n| n > 0 && selector.len() <= 4) {
+        return Err(TrailError::InvalidSelection(format!(
+            "section {selector} does not exist; `trail review` lists 1..{}",
+            review.sections.len()
+        )));
     }
     Err(TrailError::InvalidSelection(format!(
         "no checkpoint or commit {selector} in this review\n  hint: sections are numbers, checkpoints are <section>.<n>"

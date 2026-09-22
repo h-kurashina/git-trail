@@ -590,29 +590,85 @@ fn start_in_linked_worktree_stores_under_common_dir() {
 
 /// Records a session in `dir`: modify, commit, modify. Returns after the
 /// recorder has stopped.
+/// A running recorder whose watcher is known to be up: the banner line
+/// "Press Ctrl+C to stop." is printed only after the watch is installed,
+/// so waiting for it removes the race between process start and the first
+/// write. Stopped with SIGINT; `--stop-after` is only a safety net.
+struct Recorder {
+    child: std::process::Child,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Recorder {
+    fn start(dir: &Path) -> Self {
+        use std::io::BufRead;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+            .args(["start", "--stop-after", "60"])
+            .current_dir(dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = stdout.read_line(&mut line).unwrap();
+            assert!(n > 0, "recorder exited before it was ready");
+            if line.contains("Press Ctrl+C to stop.") {
+                break;
+            }
+        }
+        Recorder { child, stdout }
+    }
+
+    /// Wait for the recorder to write an event for `path` (its live output
+    /// echoes every recorded change), so the next step never races it.
+    fn wait_for(&mut self, path: &str) {
+        use std::io::BufRead;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.stdout.read_line(&mut line).unwrap();
+            assert!(n > 0, "recorder exited while waiting for {path}");
+            if line.contains(path) {
+                return;
+            }
+        }
+    }
+
+    fn stop(mut self) {
+        let ok = Command::new("kill")
+            .args(["-INT", &self.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let status = self.child.wait().unwrap();
+        let mut rest = String::new();
+        let _ = std::io::Read::read_to_string(&mut self.stdout, &mut rest);
+        let mut err = String::new();
+        if let Some(mut e) = self.child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut e, &mut err);
+        }
+        assert!(status.success(), "recorder failed: {err}\n{rest}");
+    }
+}
+
 fn record_session_with_commit(dir: &Path) {
-    let child = Command::new(env!("CARGO_BIN_EXE_trail"))
-        .args(["start", "--stop-after", "7", "--quiet"])
-        .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let mut rec = Recorder::start(dir);
     write(dir, "src/lib.rs", "fn a() {}\nfn b() {}\n// session one\n");
     write(dir, "src/one.rs", "one\n");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    rec.wait_for("src/one.rs");
+    // Well past the batch window, so the commit is its own boundary.
+    std::thread::sleep(std::time::Duration::from_millis(600));
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-qm", "recorded commit"]);
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    rec.wait_for("HEAD moved");
     write(dir, "src/lib.rs", "fn a() {}\nfn b() {}\n// session two\n");
     write(dir, "src/two.rs", "two\n");
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    rec.wait_for("src/two.rs");
+    rec.stop();
 }
 
 #[test]
