@@ -198,7 +198,9 @@ Development Sessions
 
 Opens the Development Trail of the current branch in `$VISUAL` (then
 `$EDITOR`) as plain text, the way oil.nvim turns a directory into a buffer.
-Your editor runs exactly as configured; trail adds nothing to it.
+Your editor runs exactly as configured; trail adds nothing to it. The
+variable is parsed with shell word rules, so `nvim --cmd "set signcolumn=no"`
+works.
 
 ```text
 # trail://feature/auth
