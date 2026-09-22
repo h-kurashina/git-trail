@@ -37,14 +37,36 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         let report = builder::build_sessions(&repo)?;
         return emit(cli.json, &report, terminal::render_sessions);
     }
-    if let Some(Command::Open { file, at }) = &cli.command {
-        return Ok(edit::open_file(&repo, &start, file, at.as_deref())?);
+    if let Some(Command::Open {
+        file,
+        at: None,
+        print,
+    }) = &cli.command
+    {
+        return Ok(edit::open_file(&repo, &start, file, *print)?);
     }
 
     let base = repo.resolve_base(cli.base.as_deref())?;
     match cli.command {
-        Some(Command::Start { .. }) | Some(Command::Sessions) | Some(Command::Open { .. }) => {
+        Some(Command::Start { .. })
+        | Some(Command::Sessions)
+        | Some(Command::Open { at: None, .. }) => {
             unreachable!("handled above")
+        }
+        Some(Command::Open {
+            file,
+            at: Some(checkpoint),
+            print,
+        }) => {
+            let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
+            Ok(edit::open_at(
+                &repo,
+                &trail,
+                &start,
+                &file,
+                &checkpoint,
+                print,
+            )?)
         }
         Some(Command::Edit { from, print }) => {
             let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;

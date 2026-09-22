@@ -49,8 +49,8 @@ pub enum TrailError {
     #[error("invalid trail edit: {0}\n  no changes were applied")]
     InvalidEdit(String),
 
-    #[error("{0} is not available yet")]
-    NotImplemented(String),
+    #[error("snapshot unavailable: {0}")]
+    SnapshotUnavailable(String),
 
     #[error("git {command} failed: {stderr}")]
     GitCommand { command: String, stderr: String },

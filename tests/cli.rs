@@ -1112,5 +1112,105 @@ fn open_launches_the_editor_on_the_worktree_file() {
     assert!(!out.ok);
     let out = trail(&f.root, &["open", "src/lib.rs", "--at", "synth.1"]);
     assert!(!out.ok);
-    assert!(out.stderr.contains("not available yet"));
+    assert!(out.stderr.contains("unknown checkpoint"), "{}", out.stderr);
+}
+
+#[test]
+fn snapshots_restore_file_content_at_a_checkpoint() {
+    let f = Fixture::with_feature("main");
+    record_session_with_commit(&f.root);
+
+    let json = trail_json(&f.root, &["history"]);
+    let cps = checkpoint_ids(&json);
+    assert_eq!(cps.len(), 2, "{json:#?}");
+    let (cp1, cp2) = (cps[0].0.as_str(), cps[1].0.as_str());
+    let session_id = cp1.rsplit_once('.').unwrap().0;
+
+    // The session's snapshots are protected by a ref chain, one commit per
+    // protection point (commit boundary, then session end).
+    let refname = format!("refs/trail/sessions/{session_id}");
+    let log = Command::new("git")
+        .args(["log", "--format=%s", &refname])
+        .current_dir(&f.root)
+        .output()
+        .unwrap();
+    assert!(log.status.success());
+    let subjects = String::from_utf8_lossy(&log.stdout);
+    assert!(subjects.lines().count() >= 2, "{subjects}");
+    assert!(subjects.contains("trail snapshots for session"));
+
+    let open = |args: &[&str]| trail_ok(&f.root, args);
+    assert_eq!(
+        open(&["open", "src/lib.rs", "--at", cp1, "--print"]),
+        "fn a() {}\nfn b() {}\n// session one\n"
+    );
+    assert_eq!(
+        open(&["open", "src/lib.rs", "--at", cp2, "--print"]),
+        "fn a() {}\nfn b() {}\n// session two\n"
+    );
+    // A file untouched in cp2 shows its latest earlier version.
+    assert_eq!(
+        open(&["open", "src/one.rs", "--at", cp2, "--print"]),
+        "one\n"
+    );
+    // Relative paths from a subdirectory resolve like everywhere else.
+    assert_eq!(
+        trail_ok(
+            &f.root.join("src"),
+            &["open", "lib.rs", "--at", cp1, "--print"]
+        ),
+        "fn a() {}\nfn b() {}\n// session one\n"
+    );
+    // Without --at, --print shows the worktree file.
+    assert_eq!(
+        open(&["open", "src/lib.rs", "--print"]),
+        "fn a() {}\nfn b() {}\n// session two\n"
+    );
+
+    let out = trail(&f.root, &["open", "src/two.rs", "--at", cp1, "--print"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("not recorded in or before"),
+        "{}",
+        out.stderr
+    );
+    let out = trail(
+        &f.root,
+        &["open", "src/lib.rs", "--at", "nope.1", "--print"],
+    );
+    assert!(!out.ok);
+    assert!(out.stderr.contains("unknown checkpoint"), "{}", out.stderr);
+
+    // Snapshots survive an aggressive gc because the ref keeps them reachable.
+    git(&f.root, &["gc", "-q", "--prune=now"]);
+    assert_eq!(
+        open(&["open", "src/lib.rs", "--at", cp1, "--print"]),
+        "fn a() {}\nfn b() {}\n// session one\n"
+    );
+    assert_eq!(
+        open(&["open", "src/one.rs", "--at", cp1, "--print"]),
+        "one\n"
+    );
+
+    let sessions = trail_json(&f.root, &["sessions"]);
+    assert_eq!(sessions["sessions"][0]["snapshots"], true);
+}
+
+#[test]
+fn sessions_without_snapshots_are_marked() {
+    let f = Fixture::with_feature("main");
+    write_synthetic_session(&f.root);
+    let sessions = trail_json(&f.root, &["sessions"]);
+    assert_eq!(sessions["sessions"][0]["snapshots"], false);
+    assert!(trail_ok(&f.root, &["sessions"]).contains("(no snapshots)"));
+    let out = trail(
+        &f.root,
+        &["open", "src/lib.rs", "--at", "synth.1", "--print"],
+    );
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("no snapshot for src/lib.rs"),
+        "{}",
+        out.stderr
+    );
 }

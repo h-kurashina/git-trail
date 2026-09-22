@@ -134,6 +134,8 @@ pub struct SessionSummary {
     pub last_activity: DateTime<Utc>,
     pub events: usize,
     pub checkpoints: usize,
+    /// True when `refs/trail/sessions/<id>` protects the session's snapshots.
+    pub snapshots: bool,
     pub path: PathBuf,
 }
 

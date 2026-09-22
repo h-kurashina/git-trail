@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TrailError};
 use crate::git::repository::Repo;
+use crate::recorder::checkpoint::FileChange;
 use crate::recorder::metadata::{CheckpointMeta, Metadata, Move};
+use crate::recorder::snapshot;
 use crate::trail::event::TrailEventType;
 use crate::trail::Trail;
 
@@ -503,22 +505,100 @@ fn scratch_path(branch: &str) -> PathBuf {
     std::env::temp_dir().join(format!("trail-edit-{safe}-{}.trail", std::process::id()))
 }
 
-/// `trail open <file> [--at <checkpoint>]`.
-pub fn open_file(repo: &Repo, cwd: &Path, file: &Path, at: Option<&str>) -> Result<()> {
-    if let Some(checkpoint) = at {
-        // Extension point: restore the blob recorded as `after_hash` for this
-        // path in `checkpoint` from the object database into a temp file.
-        return Err(TrailError::NotImplemented(format!(
-            "opening {} at checkpoint {checkpoint} (snapshot restore)",
-            file.display()
-        )));
-    }
+/// `trail open <file>`: the file as it is in the worktree.
+pub fn open_file(repo: &Repo, cwd: &Path, file: &Path, print: bool) -> Result<()> {
     let rel = repo.relative_path(cwd, file)?;
     let abs = repo.workdir().join(&rel);
     if !abs.exists() {
         return Err(TrailError::FileNotFound(rel));
     }
+    if print {
+        let data = std::fs::read(&abs).map_err(|e| TrailError::from_io(e, &abs))?;
+        return write_stdout(&data);
+    }
     editor::Editor::resolve()?.open(&abs)
+}
+
+/// `trail open <file> --at <checkpoint>`: the file as it was when that
+/// checkpoint ended, restored from the snapshot blobs in the object database.
+pub fn open_at(
+    repo: &Repo,
+    trail: &Trail,
+    cwd: &Path,
+    file: &Path,
+    checkpoint: &str,
+    print: bool,
+) -> Result<()> {
+    let rel = repo.relative_path(cwd, file)?;
+    let checkpoints: Vec<(&str, &chrono::DateTime<chrono::Utc>, &[FileChange])> = trail
+        .events
+        .iter()
+        .filter_map(|e| match &e.event_type {
+            TrailEventType::Checkpoint { id, changes, .. } => {
+                Some((id.as_str(), e.timestamp.as_ref()?, changes.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
+    let Some((_, target_started, _)) = checkpoints.iter().find(|(id, _, _)| *id == checkpoint)
+    else {
+        return Err(TrailError::SnapshotUnavailable(format!(
+            "unknown checkpoint {checkpoint} on this branch (see `trail history`)"
+        )));
+    };
+    // Latest recorded version of the path up to and including the checkpoint.
+    let latest = checkpoints
+        .iter()
+        .filter(|(_, started, _)| *started <= *target_started)
+        .flat_map(|(_, _, changes)| changes.iter())
+        .filter(|c| c.path == rel)
+        .max_by_key(|c| c.last_seen);
+    let Some(change) = latest else {
+        return Err(TrailError::SnapshotUnavailable(format!(
+            "{} was not recorded in or before checkpoint {checkpoint}",
+            rel.display()
+        )));
+    };
+    let Some(hash) = &change.after_hash else {
+        return Err(TrailError::SnapshotUnavailable(format!(
+            "{} had been deleted by checkpoint {checkpoint}",
+            rel.display()
+        )));
+    };
+    let Some(data) = snapshot::read_blob(repo.gix(), hash)? else {
+        return Err(TrailError::SnapshotUnavailable(format!(
+            "no snapshot for {} at {checkpoint} (recorded before snapshot support, larger than {} MiB, or pruned)",
+            rel.display(),
+            snapshot::SNAPSHOT_MAX_BYTES / (1024 * 1024)
+        )));
+    };
+    if print {
+        return write_stdout(&data);
+    }
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir().join(format!(
+        "trail-{}-{}-{name}",
+        checkpoint.replace('/', "_"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, &data).map_err(|e| TrailError::from_io(e, &tmp))?;
+    eprintln!("{} at {checkpoint} -> {}", rel.display(), tmp.display());
+    editor::Editor::resolve()?.open(&tmp)
+}
+
+fn write_stdout(data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if let Err(e) = lock.write_all(data) {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(TrailError::Io(e));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
