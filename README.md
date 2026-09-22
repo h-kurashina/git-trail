@@ -25,6 +25,7 @@ trail needs a `git` executable on `PATH`.
 ```bash
 trail
 trail status
+trail changes
 trail history
 trail diff
 trail inspect src/auth/service.ts
@@ -38,6 +39,7 @@ Global options:
 
 ```bash
 trail --base develop   # compare against a branch other than main/master
+trail --since push     # start the trail at the last push (or upstream, base, a revision)
 trail --json           # machine readable output for any command
 trail -C path/to/repo  # run against another directory
 ```
@@ -78,6 +80,40 @@ Base
 A compact view of the worktree: branch, base, how many commits you are ahead,
 and counts for modified / added / deleted / renamed / untracked as well as
 staged / unstaged.
+
+### `trail changes`
+
+What changed since the last push: commits, files (committed, staged,
+unstaged and untracked alike) and how many checkpoints were recorded in that
+window. The baseline is chosen in this order and always shown: last push
+(from the remote-tracking ref's reflog), upstream tip, base branch.
+
+```text
+Changes since last push to origin/feature/auth (bdc9c5d)
+my-project on feature/auth
+────────────────────
+
+Commits
+  4da208c Wire session validation
+
+Files
+  ~ src/auth/service.ts
+      +2 -1  unstaged
+  ~ src/routes/auth.ts
+      +1  committed
+  + tests/auth.test.ts
+      +84  untracked
+
+────────────────────
+1 commit, 3 checkpoints
+3 files changed, +87 -1  (staged 0, unstaged 1, untracked 1)
+```
+
+`--since` accepts `push`, `upstream`, `base`, `auto` or any revision and
+works with `trail`, `trail history` and `trail edit` as well. It is a view
+filter: nothing recorded is removed, the commands just start later. After a
+rebase or amend the pushed commit is no longer an ancestor of HEAD; the trail
+then starts at their common ancestor and the header says so.
 
 ### `trail history`
 
