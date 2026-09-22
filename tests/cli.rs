@@ -271,6 +271,29 @@ fn inspect_reports_status_diff_and_commits() {
 }
 
 #[test]
+fn history_includes_reflog_and_tags() {
+    let f = Fixture::with_feature("main").dirty();
+    let out = trail_ok(&f.root, &["history"]);
+    assert!(out.contains("Development Trail (detailed)"));
+    assert!(out.contains("HEAD checkout: moving from main to feature"));
+    assert!(out.contains("[+1, unstaged, time from mtime]"));
+    assert!(out.contains("[+1, untracked, time from mtime]"));
+    assert!(out.contains("         src/feature.rs"));
+    let json = trail_json(&f.root, &["history"]);
+    let reflog = json["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "ref_update")
+        .expect("reflog event");
+    assert_eq!(reflog["source"], "git_reflog");
+    assert_eq!(reflog["action"], "checkout");
+
+    let limited = trail_json(&f.root, &["history", "--limit", "2"]);
+    assert_eq!(limited["events"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn explicit_base_branch_is_respected() {
     let f = Fixture::with_feature("main");
     git(&f.root, &["branch", "develop", "main"]);
