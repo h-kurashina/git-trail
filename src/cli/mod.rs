@@ -38,6 +38,15 @@ pub enum Command {
     },
     /// Show the diff against the base branch grouped by directory
     Diff,
+    /// Record changes in this worktree until Ctrl+C
+    Start {
+        /// Stop automatically after N seconds (useful for scripts)
+        #[arg(long, value_name = "SECONDS")]
+        stop_after: Option<u64>,
+        /// Do not print events while recording
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Show change information for a single file
     Inspect {
         /// File path, relative to the current directory or the repository root
