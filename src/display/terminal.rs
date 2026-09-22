@@ -6,13 +6,15 @@ use std::io::IsTerminal;
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 
+use crate::git::baseline::{Baseline, BaselineKind};
 use crate::git::diff::{FileStat, LineStats};
 use crate::git::repository::HeadState;
 use crate::git::worktree::WorktreeKind;
 use crate::recorder::checkpoint::ChangeKind;
 use crate::trail::event::{TrailEvent, TrailEventType};
 use crate::trail::{
-    DiffReport, InspectReport, RepositoryContext, SessionsReport, StatusReport, Trail,
+    ChangedFileKind, ChangesReport, DiffReport, InspectReport, RepositoryContext, SessionsReport,
+    StatusReport, Trail,
 };
 
 const RULE: &str = "────────────────────────────────────";
@@ -92,7 +94,25 @@ fn head_line(ctx: &RepositoryContext, style: &Style, out: &mut String) {
             style.dim("(shallow clone: history may be incomplete)")
         );
     }
+    if ctx.since.kind != BaselineKind::BaseBranch {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", style.bold("Since"));
+        let _ = writeln!(out, "  {}", baseline_text(&ctx.since));
+    }
     let _ = writeln!(out);
+}
+
+/// "last push to origin/feature (8fa19d2)" plus the effective start when the
+/// baseline commit is not an ancestor of HEAD (rebase, amend).
+fn baseline_text(b: &Baseline) -> String {
+    if b.start == b.commit {
+        format!("{} ({})", b.label, b.short_commit)
+    } else {
+        format!(
+            "{} ({}, common ancestor {})",
+            b.label, b.short_commit, b.short_start
+        )
+    }
 }
 
 fn event_line(event: &TrailEvent, detailed: bool, style: &Style) -> String {
@@ -545,5 +565,87 @@ pub fn render_sessions(report: &SessionsReport) -> String {
         );
         let _ = writeln!(out);
     }
+    out
+}
+
+pub fn render_changes(report: &ChangesReport) -> String {
+    let style = Style::detect();
+    let ctx = &report.repository;
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        style.bold(&format!("Changes since {}", baseline_text(&ctx.since)))
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        style.dim(&format!("{} on {}", ctx.name, ctx.head.label()))
+    );
+    let _ = writeln!(out, "{SHORT_RULE}");
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "{}", style.bold("Commits"));
+    if report.commits.is_empty() {
+        let _ = writeln!(out, "  {}", style.dim("none"));
+    }
+    for c in &report.commits {
+        let _ = writeln!(out, "  {} {}", c.short_id, c.summary);
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "{}", style.bold("Files"));
+    if report.files.is_empty() {
+        let _ = writeln!(out, "  {}", style.dim("none"));
+    }
+    for f in &report.files {
+        let mark = match f.kind {
+            ChangedFileKind::Added => "+",
+            ChangedFileKind::Modified => "~",
+            ChangedFileKind::Deleted => "-",
+            ChangedFileKind::Renamed => ">",
+        };
+        let state = match &f.status {
+            Some(s) if s.untracked => "untracked",
+            Some(s) if s.staged.is_some() && s.unstaged.is_some() => "staged, unstaged",
+            Some(s) if s.staged.is_some() => "staged",
+            Some(_) => "unstaged",
+            None => "committed",
+        };
+        let name = match &f.stat.old_path {
+            Some(old) => format!("{} -> {}", old.display(), f.stat.path.display()),
+            None => f.stat.path.display().to_string(),
+        };
+        let _ = writeln!(out, "  {mark} {name}");
+        let _ = writeln!(
+            out,
+            "      {}  {}",
+            file_stat_text(&f.stat),
+            style.dim(state)
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{SHORT_RULE}");
+    let c = &report.counts;
+    let _ = writeln!(
+        out,
+        "{} commit{}, {} checkpoint{}",
+        report.commits.len(),
+        if report.commits.len() == 1 { "" } else { "s" },
+        report.checkpoints,
+        if report.checkpoints == 1 { "" } else { "s" }
+    );
+    let _ = writeln!(
+        out,
+        "{} file{} changed, {}  {}",
+        report.files.len(),
+        if report.files.len() == 1 { "" } else { "s" },
+        plus_minus(&report.stats),
+        style.dim(&format!(
+            "(staged {}, unstaged {}, untracked {})",
+            c.staged, c.unstaged, c.untracked
+        ))
+    );
     out
 }

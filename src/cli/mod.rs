@@ -14,6 +14,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "BRANCH")]
     pub base: Option<String>,
 
+    /// Start the trail at a baseline: push, upstream, base, auto or a revision
+    #[arg(long, global = true, value_name = "BASELINE")]
+    pub since: Option<String>,
+
     /// Emit machine readable JSON instead of text
     #[arg(long, global = true)]
     pub json: bool,
@@ -30,6 +34,8 @@ pub struct Cli {
 pub enum Command {
     /// Show a compact summary of the current worktree
     Status,
+    /// Show what changed since the last push (or upstream, or base)
+    Changes,
     /// Show the development trail in detail (commits, reflog, working tree)
     History {
         /// Only show the most recent N events
