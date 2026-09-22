@@ -6,11 +6,14 @@ trail is a local-first CLI that reconstructs the development history of a Git wo
 
 ## Install
 
+trail is not published on crates.io yet (the `trail` crate there is an unrelated
+project). Install it from this repository:
+
 ```bash
-cargo install trail
+cargo install --git https://github.com/h-kurashina/trail
 ```
 
-Or from source:
+Or from a local checkout:
 
 ```bash
 git clone https://github.com/h-kurashina/trail
