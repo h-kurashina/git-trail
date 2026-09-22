@@ -647,19 +647,13 @@ fn checkpoint_meta(cp: &ReviewCheckpoint, style: &Style, out: &mut String) {
         local(&cp.ended_at).format("%H:%M"),
         style.dim(&cp.id)
     );
-    let mut tail = String::new();
-    if cp.bulk {
-        tail.push_str(" (bulk)");
-    }
-    if cp.attachment == Some(Attachment::Inferred) {
-        tail.push_str(&style.dim("  [commit inferred]"));
-    }
     let _ = writeln!(
         out,
-        "      {} file{}  {}{tail}",
+        "      {} file{}  {}{}",
         cp.files.len(),
         plural(cp.files.len()),
-        cp.stats
+        cp.stats,
+        if cp.bulk { " (bulk)" } else { "" }
     );
     if let Some(note) = &cp.annotation {
         let _ = writeln!(out, "      {}", style.dim(note));
