@@ -42,6 +42,18 @@ pub enum ChangedFileKind {
     Renamed,
 }
 
+impl ChangedFileKind {
+    /// One-character marker used in file lists: `+ ~ - >`.
+    pub fn mark(self) -> &'static str {
+        match self {
+            ChangedFileKind::Added => "+",
+            ChangedFileKind::Modified => "~",
+            ChangedFileKind::Deleted => "-",
+            ChangedFileKind::Renamed => ">",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangedFile {
     #[serde(flatten)]

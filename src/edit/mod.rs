@@ -590,15 +590,7 @@ pub fn open_at(
 }
 
 fn write_stdout(data: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    if let Err(e) = lock.write_all(data) {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(TrailError::Io(e));
-        }
-    }
-    Ok(())
+    crate::display::write_stdout(data).map_err(TrailError::Io)
 }
 
 #[cfg(test)]
