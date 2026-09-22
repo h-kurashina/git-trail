@@ -437,3 +437,103 @@ fn json_output_is_stable_for_piping() {
     assert!(json["events"].is_array());
     assert!(json["summary"]["files_changed"].is_number());
 }
+
+#[test]
+fn start_records_content_changes_as_jsonl() {
+    let f = Fixture::with_feature("main");
+    write(&f.root, ".gitignore", "target/\n");
+    git(&f.root, &["add", ".gitignore"]);
+    git(&f.root, &["commit", "-qm", "ignore target"]);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .args(["start", "--stop-after", "6", "--quiet"])
+        .current_dir(&f.root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Give the watcher time to attach before making changes.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    write(&f.root, "src/lib.rs", "fn a() {}\nfn b() {}\n// recorded\n"); // modified
+    write(&f.root, "notes.txt", "new\n"); // added
+    write(&f.root, "target/out.txt", "ignored\n"); // gitignored
+    std::fs::File::options()
+        .append(true)
+        .open(f.root.join("README.md"))
+        .unwrap(); // mtime only, content unchanged
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    std::fs::remove_file(f.root.join("notes.txt")).unwrap(); // deleted
+
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dir = f.root.join(".git/trail/worktrees/main");
+    let log = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .expect("session file");
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert_eq!(lines[0]["kind"], "session");
+    assert_eq!(lines[0]["worktree_id"], "main");
+    assert_eq!(lines[0]["branch"], "feature");
+    assert_eq!(lines.last().unwrap()["kind"], "end");
+
+    let events: Vec<&serde_json::Value> = lines.iter().filter(|l| l["kind"] == "event").collect();
+    let find = |ty: &str, path: &str| {
+        events
+            .iter()
+            .find(|e| e["type"] == ty && e["path"] == path)
+            .unwrap_or_else(|| panic!("missing {ty} {path} in {events:?}"))
+    };
+    let modified = find("modified", "src/lib.rs");
+    assert!(modified["before_hash"].is_string());
+    assert!(modified["after_hash"].is_string());
+    assert_ne!(modified["before_hash"], modified["after_hash"]);
+    let added = find("added", "notes.txt");
+    assert!(added["before_hash"].is_null());
+    let deleted = find("deleted", "notes.txt");
+    assert_eq!(deleted["before_hash"], added["after_hash"]);
+    assert!(deleted["after_hash"].is_null());
+    assert!(!events
+        .iter()
+        .any(|e| e["path"].as_str().unwrap().starts_with("target/")));
+    assert!(!events.iter().any(|e| e["path"] == "README.md"));
+    assert!(!events
+        .iter()
+        .any(|e| e["path"].as_str().unwrap().starts_with(".git")));
+}
+
+#[test]
+fn start_in_linked_worktree_stores_under_common_dir() {
+    let f = Fixture::with_feature("main");
+    let wt_dir = TempDir::new().unwrap();
+    let wt = wt_dir.path().join("wt");
+    git(
+        &f.root,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "rec"],
+    );
+    let wt = wt.canonicalize().unwrap();
+
+    let out = trail(&wt, &["start", "--stop-after", "1", "--quiet"]);
+    assert!(out.ok, "{}", out.stderr);
+    let dir = f.root.join(".git/trail/worktrees/wt");
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(entries.len(), 1, "one session file in the common dir");
+    let text = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(header["worktree_id"], "wt");
+    assert_eq!(header["branch"], "rec");
+    assert_eq!(header["worktree_path"], wt.to_str().unwrap());
+    assert!(text.lines().last().unwrap().contains("\"end\""));
+}

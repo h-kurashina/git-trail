@@ -28,6 +28,7 @@ trail status
 trail history
 trail diff
 trail inspect src/auth/service.ts
+trail start
 ```
 
 Global options:
@@ -93,6 +94,45 @@ Status, line stats (vs HEAD and vs base) and the commits that touched a single
 file, following renames. Commits that are on the current branch but not on the
 base are marked with `*`.
 
+### `trail start`
+
+Records what changes in the worktree while you (or a coding agent) work, until
+Ctrl+C. This is the first information trail holds that Git does not.
+
+```text
+$ trail start
+
+Recording development trail...
+Worktree: feature/auth
+Session: 20260922T051926Z-a353
+Log: .git/trail/worktrees/main/session-20260922T051926Z-a353.jsonl
+
+Press Ctrl+C to stop.
+
+14:19:27  modified src/auth/service.ts
+14:19:28  added tests/auth.test.ts
+```
+
+Only real content changes are recorded: every notification is verified by
+hashing the file and comparing it with the last known content, so editor
+saves without changes and mtime-only touches are dropped. Paths matched by
+`.gitignore` and everything under `.git` are skipped.
+
+Sessions are append-only JSONL files under
+`<common git dir>/trail/worktrees/<worktree id>/`, so they survive
+`git worktree remove`. Each event carries the git blob id of the content
+before and after the change:
+
+```json
+{"kind":"session","version":1,"session_id":"...","worktree_id":"main","branch":"feature/auth","base_commit":"2b86c0e...","started_at":"..."}
+{"kind":"event","ts":"...","type":"modified","path":"src/auth/service.ts","before_hash":"70e5878...","after_hash":"40fcf65..."}
+{"kind":"end","ended_at":"...","events":2}
+```
+
+`--stop-after <seconds>` stops automatically, `--quiet` suppresses the live
+output. Recorded sessions are not yet shown by `trail history`; that is the
+next step.
+
 ## How it works
 
 trail never talks to the network and never sends anything anywhere. It reads:
@@ -101,6 +141,7 @@ trail never talks to the network and never sends anything anywhere. It reads:
 * the HEAD reflog
 * the index and working tree (`git status`, `git diff --numstat`)
 * file modification times
+* sessions recorded by `trail start`
 
 Every event carries a `source` and a `confidence`. Commit and reflog times are
 exact. Working tree events only have the file's mtime, which is recorded as
