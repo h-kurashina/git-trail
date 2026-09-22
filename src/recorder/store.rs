@@ -100,14 +100,10 @@ pub fn worktree_id(repo: &Repo) -> String {
     repo.worktree.id.clone().unwrap_or_else(|| "main".into())
 }
 
-/// Sortable, human readable id: UTC time plus a few bits of the pid so two
-/// recorders started in the same second do not collide.
+/// ULID: millisecond timestamp plus 80 random bits, so ids sort by time and
+/// never collide across worktrees or processes sharing one common dir.
 pub fn new_session_id(now: DateTime<Utc>) -> String {
-    format!(
-        "{}-{:03x}",
-        now.format("%Y%m%d-%H%M%S"),
-        std::process::id() & 0xfff
-    )
+    ulid::Ulid::from_datetime(now.into()).to_string()
 }
 
 /// Append-only writer. Every record is flushed immediately so a crash loses at

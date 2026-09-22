@@ -245,7 +245,10 @@ fn merge_base_time(repo: &Repo, base: &BaseRef) -> Option<DateTime<Utc>> {
     chrono::TimeZone::timestamp_opt(&Utc, time.seconds, 0).single()
 }
 
-/// Sessions that belong to this worktree or branch.
+/// Sessions that belong to this worktree, or that were recorded on this
+/// branch *and* whose starting commit is part of the current history. The
+/// second condition keeps a branch name that was deleted and later reused
+/// from dragging in an unrelated trail.
 fn sessions_for(repo: &Repo) -> Result<Vec<SessionFile>> {
     let worktree_id = store::worktree_id(repo);
     let branch = match &repo.head {
@@ -255,9 +258,30 @@ fn sessions_for(repo: &Repo) -> Result<Vec<SessionFile>> {
     Ok(store::list_sessions(&repo.worktree.common_dir)?
         .into_iter()
         .filter(|s| {
-            s.header.worktree_id == worktree_id || (branch.is_some() && s.header.branch == branch)
+            s.header.worktree_id == worktree_id
+                || (branch.is_some()
+                    && s.header.branch == branch
+                    && s.header
+                        .start_head
+                        .as_deref()
+                        .is_some_and(|h| is_ancestor_of_head(repo, h)))
         })
         .collect())
+}
+
+/// True when `oid` is reachable from HEAD (or is HEAD). Unknown or garbage
+/// collected objects are not ancestors.
+fn is_ancestor_of_head(repo: &Repo, oid: &str) -> bool {
+    let Ok(id) = gix::ObjectId::from_hex(oid.as_bytes()) else {
+        return false;
+    };
+    if id == repo.head_id {
+        return true;
+    }
+    match repo.gix().merge_base(repo.head_id, id) {
+        Ok(base) => base.detach() == id,
+        Err(_) => false,
+    }
 }
 
 /// A checkpoint plus the time until which its session kept watching.
