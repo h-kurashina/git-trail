@@ -1425,3 +1425,148 @@ fn baseline_after_amend_uses_the_common_ancestor() {
     );
     assert!(trail_ok(&f.root, &["changes"]).contains("common ancestor"));
 }
+
+#[test]
+fn review_lists_checkpoints_and_shows_per_checkpoint_diffs() {
+    let f = Fixture::with_feature("main");
+    record_session_with_commit(&f.root);
+
+    let json = trail_json(&f.root, &["review"]);
+    let cps = json["checkpoints"].as_array().unwrap();
+    assert_eq!(cps.len(), 2, "{json:#?}");
+    assert_eq!(cps[0]["number"], 1);
+    assert_eq!(cps[1]["number"], 2);
+    let files1 = cps[0]["files"].as_array().unwrap();
+    let lib1 = files1.iter().find(|x| x["path"] == "src/lib.rs").unwrap();
+    assert_eq!(lib1["kind"], "modified");
+    assert_eq!(lib1["additions"], 1);
+    assert_eq!(lib1["deletions"], 0);
+    assert_eq!(lib1["snapshot"], true);
+    let one = files1.iter().find(|x| x["path"] == "src/one.rs").unwrap();
+    assert_eq!(one["kind"], "created");
+    assert_eq!(one["additions"], 1);
+    assert_eq!(json["files_changed"], 3);
+    assert_eq!(json["stats"]["additions"], 4);
+    assert_eq!(json["stats"]["deletions"], 1);
+
+    let text = trail_ok(&f.root, &["review"]);
+    assert!(text.contains("[1] Checkpoint 1"));
+    assert!(text.contains("[2] Checkpoint 2"));
+    assert!(text.contains("~ src/lib.rs  +1"));
+    assert!(text.contains("+ src/one.rs  +1"));
+    assert!(text.contains("2 checkpoints, 3 files, +4 -1"));
+
+    // One checkpoint, by number and by id.
+    let one_text = trail_ok(&f.root, &["review", "2"]);
+    assert!(one_text.contains("[2] Checkpoint 2"));
+    assert!(one_text.contains("+ src/two.rs  +1"));
+    let by_id = trail_json(&f.root, &["review", cps[1]["id"].as_str().unwrap()]);
+    assert_eq!(by_id["number"], 2);
+
+    // Per-checkpoint diff: what checkpoint 2 changed in src/lib.rs is the
+    // step from "session one" to "session two", not baseline..HEAD.
+    let diff2 = trail_ok(&f.root, &["review", "2", "src/lib.rs"]);
+    assert!(
+        diff2.contains("--- a/src/lib.rs\n+++ b/src/lib.rs\n"),
+        "{diff2}"
+    );
+    assert!(
+        diff2.contains("-// session one\n+// session two\n"),
+        "{diff2}"
+    );
+    let diff1 = trail_ok(&f.root, &["review", "1", "src/lib.rs"]);
+    assert!(diff1.contains("+// session one\n"), "{diff1}");
+    assert!(!diff1.contains("session two"), "{diff1}");
+    let created = trail_ok(&f.root, &["review", "1", "src/one.rs"]);
+    assert!(
+        created.contains("--- /dev/null\n+++ b/src/one.rs\n"),
+        "{created}"
+    );
+    assert!(created.contains("+one\n"));
+    // Relative path from a subdirectory and JSON shape.
+    let from_src = trail_json(&f.root.join("src"), &["review", "2", "lib.rs"]);
+    assert_eq!(from_src["file"]["path"], "src/lib.rs");
+    assert!(from_src["diff"]
+        .as_str()
+        .unwrap()
+        .contains("+// session two"));
+
+    // Errors are specific.
+    let out = trail(&f.root, &["review", "9"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("checkpoint 9 does not exist"),
+        "{}",
+        out.stderr
+    );
+    let out = trail(&f.root, &["review", "1", "src/two.rs"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("is not part of checkpoint 1"),
+        "{}",
+        out.stderr
+    );
+    let out = trail(&f.root, &["review", "nope.9"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("no checkpoint nope.9"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn review_open_launches_the_editor_on_the_after_snapshot() {
+    let f = Fixture::with_feature("main");
+    record_session_with_commit(&f.root);
+    let log = f.root.join("opened.log");
+    let script = fake_editor(&f.root, &format!("cat \"$1\" >> {}", log.display()));
+    let out = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .args(["review", "1", "src/lib.rs", "--open"])
+        .current_dir(&f.root)
+        .env("EDITOR", &script)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "fn a() {}\nfn b() {}\n// session one\n"
+    );
+}
+
+#[test]
+fn review_marks_missing_snapshots_and_respects_since_and_hidden() {
+    let f = Fixture::with_feature("main");
+    write_synthetic_session(&f.root); // hashes are not real blobs
+    let json = trail_json(&f.root, &["review"]);
+    assert_eq!(json["checkpoints"][0]["files"][0]["snapshot"], false);
+    assert!(json["checkpoints"][0]["files"][0]["additions"].is_null());
+    assert!(trail_ok(&f.root, &["review"]).contains("snapshot unavailable"));
+    let out = trail_ok(&f.root, &["review", "1", "src/lib.rs"]);
+    assert!(out.contains("snapshot unavailable for this change"));
+
+    // Hidden checkpoints leave the review and the numbering closes the gap.
+    let edited = f.root.join("hide.trail");
+    std::fs::write(
+        &edited,
+        "[checkpoint:synth.1]\nhidden = true\n\nsrc/lib.rs\nsrc/one.rs\n[checkpoint:synth.2]\ntitle = Tests\n\nsrc/lib.rs\ntests/t.rs\n",
+    )
+    .unwrap();
+    trail_ok(&f.root, &["edit", "--from", edited.to_str().unwrap()]);
+    let json = trail_json(&f.root, &["review"]);
+    assert_eq!(json["checkpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(json["checkpoints"][0]["number"], 1);
+    assert_eq!(json["checkpoints"][0]["id"], "synth.2");
+    assert!(trail_ok(&f.root, &["review"]).contains("[1] Tests"));
+
+    // --since HEAD: no checkpoints started before HEAD's commit time... they
+    // did start after it (synthetic timestamps are now), so they stay; the
+    // header shows the baseline that was chosen.
+    let text = trail_ok(&f.root, &["review", "--since", "HEAD"]);
+    assert!(text.contains("since commit "));
+}
