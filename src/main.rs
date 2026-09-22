@@ -6,6 +6,7 @@
 
 mod cli;
 mod display;
+mod edit;
 mod error;
 mod git;
 mod recorder;

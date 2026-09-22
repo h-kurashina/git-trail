@@ -26,3 +26,4 @@ gix = { version = "0.87", default-features = false, features = ["revision", "blo
 
 [dev-dependencies]
 tempfile = "3"
+chrono = "0.4"

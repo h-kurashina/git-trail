@@ -10,6 +10,7 @@
 //! with the same content in one batch is one rename.
 
 pub mod checkpoint;
+pub mod metadata;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};

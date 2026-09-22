@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::{Cli, Command};
 use crate::display::terminal;
+use crate::edit;
 use crate::git::repository::Repo;
 use crate::recorder;
 use crate::trail::builder;
@@ -36,10 +37,19 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         let report = builder::build_sessions(&repo)?;
         return emit(cli.json, &report, terminal::render_sessions);
     }
+    if let Some(Command::Open { file, at }) = &cli.command {
+        return Ok(edit::open_file(&repo, &start, file, at.as_deref())?);
+    }
 
     let base = repo.resolve_base(cli.base.as_deref())?;
     match cli.command {
-        Some(Command::Start { .. }) | Some(Command::Sessions) => unreachable!("handled above"),
+        Some(Command::Start { .. }) | Some(Command::Sessions) | Some(Command::Open { .. }) => {
+            unreachable!("handled above")
+        }
+        Some(Command::Edit { from, print }) => {
+            let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
+            Ok(edit::run(&repo, &trail, from.as_deref(), print)?)
+        }
         None => {
             let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
             emit(cli.json, &trail, terminal::render_trail)
