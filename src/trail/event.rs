@@ -30,7 +30,18 @@ pub enum TrailEventType {
         action: String,
         message: String,
     },
-    // Extension points (not implemented in the MVP):
+    /// A group of changes observed by `trail start`, with any human edits
+    /// from the metadata overlay applied.
+    Checkpoint {
+        id: String,
+        session_id: String,
+        title: Option<String>,
+        annotation: Option<String>,
+        bulk: bool,
+        hidden: bool,
+        changes: Vec<crate::recorder::checkpoint::FileChange>,
+    },
+    // Extension points (not implemented yet):
     // AgentSession { tool: String, ... }  -- Claude Code / Codex session events
     // LogicalGroup { title: String, ... } -- `trail why`
 }
@@ -43,7 +54,9 @@ pub enum EventSource {
     GitReflog,
     WorkingTree,
     Filesystem,
-    // Future: ClaudeCodeSession, CodexSession, FileWatcher
+    /// Observed live by `trail start`.
+    TrailRecorder,
+    // Future: ClaudeCodeSession, CodexSession
 }
 
 /// How much to trust the *timestamp and ordering* of an event.

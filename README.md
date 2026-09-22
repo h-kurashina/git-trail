@@ -29,6 +29,7 @@ trail history
 trail diff
 trail inspect src/auth/service.ts
 trail start
+trail sessions
 ```
 
 Global options:
@@ -141,8 +142,55 @@ before and after the change:
 ```
 
 `--stop-after <seconds>` stops automatically, `--quiet` suppresses the live
-output. Recorded sessions are not yet shown by `trail history`; that is the
-next step.
+output.
+
+When HEAD moves while recording (a commit, for example), the recorder confirms
+the new object id with gix and writes a `commit` record, so checkpoints never
+straddle a commit.
+
+### Checkpoints
+
+Raw events are never shown directly. When a trail is built they are folded
+into checkpoints:
+
+* edits to the same file closer than 500 ms are one edit
+* a gap of more than 30 seconds between events starts a new checkpoint
+* a commit always closes the open checkpoint
+* checkpoints touching more than 20 files are flagged `bulk` and collapsed
+
+Checkpoints appear in `trail` and `trail history` as `Session` events with
+`source: trail_recorder` and `confidence: exact`. Where a checkpoint covers a
+file, the mtime-based guess for that file is dropped, so exact observations
+replace inferred ones instead of being shown twice.
+
+```text
+14:33  Session 20260922-053305-c02.1  2 modified
+         ~ src/auth/service.ts
+         ~ src/routes/auth.ts
+14:33  Committed 6e3cba8 Auth route work (2 files)
+14:33  Session 20260922-053305-c02.2  1 created, 1 modified
+         ~ src/auth/service.ts
+         + tests/more.test.ts
+```
+
+### `trail sessions`
+
+Lists every recorded session of the repository, including sessions whose
+worktree has since been removed.
+
+```text
+Development Sessions
+
+20260922-053305-c02
+  feature/auth
+  2026-09-22 14:33 - 14:41
+  2 checkpoints
+
+20260922-060102-1f4
+  agent/payments  (worktree removed)
+  2026-09-22 15:01 - 15:58
+  7 checkpoints
+```
 
 ## How it works
 

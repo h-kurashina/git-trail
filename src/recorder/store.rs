@@ -74,6 +74,13 @@ pub struct SessionEnd {
 pub enum Record {
     Session(SessionHeader),
     Event(RawEvent),
+    /// HEAD moved while recording (a commit, checkout, reset, ...). Written
+    /// only after gix confirmed the OID really changed.
+    Commit {
+        timestamp: DateTime<Utc>,
+        from_head: String,
+        to_head: String,
+    },
     End(SessionEnd),
 }
 
@@ -138,6 +145,19 @@ impl SessionWriter {
         self.write(&Record::Event(event.clone()))
     }
 
+    pub fn record_commit(
+        &mut self,
+        timestamp: DateTime<Utc>,
+        from_head: &str,
+        to_head: &str,
+    ) -> Result<()> {
+        self.write(&Record::Commit {
+            timestamp,
+            from_head: from_head.to_string(),
+            to_head: to_head.to_string(),
+        })
+    }
+
     pub fn finish(mut self, ended_at: DateTime<Utc>) -> Result<()> {
         let end = SessionEnd {
             ended_at,
@@ -155,7 +175,6 @@ impl SessionWriter {
     }
 }
 
-#[allow(dead_code)] // consumed by `trail history` once sessions are integrated (next PR)
 /// Read every parseable record of a session file. Corrupt or truncated lines
 /// are skipped so a crashed session is still readable.
 pub fn read_session(path: &Path) -> Result<Vec<Record>> {
@@ -169,6 +188,86 @@ pub fn read_session(path: &Path) -> Result<Vec<Record>> {
         }
     }
     Ok(records)
+}
+
+/// A session file as found on disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionFile {
+    pub path: PathBuf,
+    pub header: SessionHeader,
+    #[serde(skip)]
+    pub records: Vec<Record>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub events: usize,
+    pub commits: usize,
+}
+
+impl SessionFile {
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let records = read_session(path)?;
+        let Some(Record::Session(header)) = records.first().cloned() else {
+            return Ok(None); // not a session file (or its first line is corrupt)
+        };
+        let ended_at = records.iter().find_map(|r| match r {
+            Record::End(end) => Some(end.ended_at),
+            _ => None,
+        });
+        Ok(Some(SessionFile {
+            path: path.to_path_buf(),
+            events: records
+                .iter()
+                .filter(|r| matches!(r, Record::Event(_)))
+                .count(),
+            commits: records
+                .iter()
+                .filter(|r| matches!(r, Record::Commit { .. }))
+                .count(),
+            header,
+            records,
+            ended_at,
+        }))
+    }
+
+    /// Timestamp of the last record, used while a session is still open.
+    pub fn last_activity(&self) -> DateTime<Utc> {
+        self.records
+            .iter()
+            .rev()
+            .map(|r| match r {
+                Record::Event(e) => e.timestamp,
+                Record::Commit { timestamp, .. } => *timestamp,
+                Record::End(e) => e.ended_at,
+                Record::Session(h) => h.started_at,
+            })
+            .next()
+            .unwrap_or(self.header.started_at)
+    }
+}
+
+/// Every session stored for the repository, across all worktrees (including
+/// ones that no longer exist), oldest first.
+pub fn list_sessions(common_dir: &Path) -> Result<Vec<SessionFile>> {
+    let root = common_dir.join("trail").join("worktrees");
+    let mut sessions = Vec::new();
+    let Ok(worktrees) = std::fs::read_dir(&root) else {
+        return Ok(sessions);
+    };
+    for worktree in worktrees.flatten() {
+        let dir = worktree.path().join("sessions");
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_some_and(|e| e == "jsonl") {
+                if let Some(session) = SessionFile::load(&path)? {
+                    sessions.push(session);
+                }
+            }
+        }
+    }
+    sessions.sort_by_key(|s| s.header.started_at);
+    Ok(sessions)
 }
 
 #[cfg(test)]

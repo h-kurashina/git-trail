@@ -32,9 +32,14 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         )?);
     }
 
+    if let Some(Command::Sessions) = cli.command {
+        let report = builder::build_sessions(&repo)?;
+        return emit(cli.json, &report, terminal::render_sessions);
+    }
+
     let base = repo.resolve_base(cli.base.as_deref())?;
     match cli.command {
-        Some(Command::Start { .. }) => unreachable!("handled above"),
+        Some(Command::Start { .. }) | Some(Command::Sessions) => unreachable!("handled above"),
         None => {
             let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
             emit(cli.json, &trail, terminal::render_trail)
