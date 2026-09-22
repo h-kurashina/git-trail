@@ -26,7 +26,6 @@ pub enum TrailEventType {
     },
     /// A HEAD movement recorded in the reflog that is not a plain commit
     /// (checkout, rebase, reset, amend, merge, cherry-pick, ...).
-    #[allow(dead_code)] // produced by `trail history` (Phase 2)
     RefUpdate {
         action: String,
         message: String,
@@ -41,7 +40,6 @@ pub enum TrailEventType {
 #[serde(rename_all = "snake_case")]
 pub enum EventSource {
     GitCommit,
-    #[allow(dead_code)] // produced by `trail history` (Phase 2)
     GitReflog,
     WorkingTree,
     Filesystem,
