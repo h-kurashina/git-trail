@@ -1,0 +1,84 @@
+//! `TrailEvent`: the unit of a Development Trail.
+
+use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+
+use crate::git::diff::LineStats;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TrailEventType {
+    FileAdded,
+    FileModified,
+    FileDeleted,
+    FileRenamed {
+        from: PathBuf,
+    },
+    Commit {
+        id: String,
+        short_id: String,
+        summary: String,
+        author: String,
+        /// Merge commits are shown but their file list is relative to the first parent.
+        is_merge: bool,
+    },
+    /// A HEAD movement recorded in the reflog that is not a plain commit
+    /// (checkout, rebase, reset, amend, merge, cherry-pick, ...).
+    #[allow(dead_code)] // produced by `trail history` (Phase 2)
+    RefUpdate {
+        action: String,
+        message: String,
+    },
+    // Extension points (not implemented in the MVP):
+    // AgentSession { tool: String, ... }  -- Claude Code / Codex session events
+    // LogicalGroup { title: String, ... } -- `trail why`
+}
+
+/// Where the event was reconstructed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSource {
+    GitCommit,
+    #[allow(dead_code)] // produced by `trail history` (Phase 2)
+    GitReflog,
+    WorkingTree,
+    Filesystem,
+    // Future: ClaudeCodeSession, CodexSession, FileWatcher
+}
+
+/// How much to trust the *timestamp and ordering* of an event.
+///
+/// The change itself is always real (it was read from git or the disk); what
+/// may be inferred is *when* it happened. Commit and reflog times are exact.
+/// A working tree change only has the file's mtime, which is a lower bound at
+/// best: an editor, a checkout or a formatter can rewrite it at any time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    Exact,
+    Inferred,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrailEvent {
+    /// `None` when nothing on disk records a time (e.g. a deleted file).
+    pub timestamp: Option<DateTime<Utc>>,
+    #[serde(flatten)]
+    pub event_type: TrailEventType,
+    pub files: Vec<PathBuf>,
+    pub source: EventSource,
+    pub confidence: Confidence,
+    pub stats: Option<LineStats>,
+    /// Staging state for working tree events: true = staged, false = unstaged,
+    /// None = not applicable (commits, untracked files, reflog).
+    pub staged: Option<bool>,
+}
+
+impl TrailEvent {
+    /// Whether the event counts as a "change" in summaries.
+    pub fn is_change(&self) -> bool {
+        !matches!(self.event_type, TrailEventType::RefUpdate { .. })
+    }
+}
