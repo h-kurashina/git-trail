@@ -9,8 +9,11 @@ use chrono::{DateTime, Local, NaiveDate, Utc};
 use crate::git::diff::{FileStat, LineStats};
 use crate::git::repository::HeadState;
 use crate::git::worktree::WorktreeKind;
+use crate::recorder::checkpoint::ChangeKind;
 use crate::trail::event::{TrailEvent, TrailEventType};
-use crate::trail::{DiffReport, InspectReport, RepositoryContext, StatusReport, Trail};
+use crate::trail::{
+    DiffReport, InspectReport, RepositoryContext, SessionsReport, StatusReport, Trail,
+};
 
 const RULE: &str = "────────────────────────────────────";
 const SHORT_RULE: &str = "────────────────────";
@@ -117,6 +120,42 @@ fn event_line(event: &TrailEvent, detailed: bool, style: &Style) -> String {
             };
             format!("{kind} {short_id} {summary}{}", style.dim(&files))
         }
+        TrailEventType::Checkpoint {
+            id,
+            title,
+            bulk,
+            changes,
+            ..
+        } => {
+            let mut counts = [0usize; 4];
+            for c in changes {
+                counts[match c.kind {
+                    ChangeKind::Created => 0,
+                    ChangeKind::Modified => 1,
+                    ChangeKind::Deleted => 2,
+                    ChangeKind::Renamed => 3,
+                }] += 1;
+            }
+            let mut parts = Vec::new();
+            for (n, label) in counts
+                .iter()
+                .zip(["created", "modified", "deleted", "renamed"])
+            {
+                if *n > 0 {
+                    parts.push(format!("{n} {label}"));
+                }
+            }
+            let what = match title {
+                Some(t) => format!("\"{t}\""),
+                None => parts.join(", "),
+            };
+            let bulk_tag = if *bulk {
+                style.dim(&format!(" (bulk, {} files)", changes.len()))
+            } else {
+                String::new()
+            };
+            format!("Session {}  {what}{bulk_tag}", style.dim(id))
+        }
         TrailEventType::RefUpdate { action, message } => {
             let text = if message.is_empty() {
                 action.clone()
@@ -161,6 +200,9 @@ fn events_block(events: &[TrailEvent], detailed: bool, style: &Style, out: &mut 
     let mut current_day: Option<NaiveDate> = None;
     let mut printed_undated = false;
     for event in events {
+        if let TrailEventType::Checkpoint { hidden: true, .. } = event.event_type {
+            continue;
+        }
         match &event.timestamp {
             Some(ts) => {
                 let day = local(ts).date_naive();
@@ -184,10 +226,55 @@ fn events_block(events: &[TrailEvent], detailed: bool, style: &Style, out: &mut 
         }
         let _ = writeln!(out, "{}", event_line(event, detailed, style));
         if detailed {
-            if let TrailEventType::Commit { .. } = event.event_type {
-                for file in &event.files {
-                    let _ = writeln!(out, "         {}", file.display());
+            match &event.event_type {
+                TrailEventType::Commit { .. } => {
+                    for file in &event.files {
+                        let _ = writeln!(out, "         {}", file.display());
+                    }
                 }
+                TrailEventType::Checkpoint {
+                    changes,
+                    bulk,
+                    annotation,
+                    ..
+                } => {
+                    if let Some(note) = annotation {
+                        let _ = writeln!(out, "         {}", style.dim(note));
+                    }
+                    if *bulk {
+                        let _ = writeln!(
+                            out,
+                            "         {}",
+                            style.dim(&format!(
+                                "{} files changed (bulk, collapsed)",
+                                changes.len()
+                            ))
+                        );
+                    } else {
+                        for c in changes {
+                            let mark = match c.kind {
+                                ChangeKind::Created => "+",
+                                ChangeKind::Modified => "~",
+                                ChangeKind::Deleted => "-",
+                                ChangeKind::Renamed => ">",
+                            };
+                            match &c.from_path {
+                                Some(from) => {
+                                    let _ = writeln!(
+                                        out,
+                                        "         {mark} {} -> {}",
+                                        from.display(),
+                                        c.path.display()
+                                    );
+                                }
+                                None => {
+                                    let _ = writeln!(out, "         {mark} {}", c.path.display());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -416,6 +503,46 @@ pub fn render_inspect(report: &InspectReport) -> String {
     }
     if report.commits.iter().any(|c| c.on_branch) {
         let _ = writeln!(out, "  {}", style.dim("* on this branch, not on base"));
+    }
+    out
+}
+
+pub fn render_sessions(report: &SessionsReport) -> String {
+    let style = Style::detect();
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Development Sessions"));
+    let _ = writeln!(out);
+    if report.sessions.is_empty() {
+        let _ = writeln!(
+            out,
+            "  {}",
+            style.dim("no recorded sessions (run `trail start`)")
+        );
+        return out;
+    }
+    for s in &report.sessions {
+        let _ = writeln!(out, "{}", style.bold(&s.session_id));
+        let branch = s.branch.clone().unwrap_or_else(|| "(detached)".into());
+        let worktree = if s.worktree_exists {
+            String::new()
+        } else {
+            style.dim("  (worktree removed)")
+        };
+        let _ = writeln!(out, "  {branch}{worktree}");
+        let start = local(&s.started_at);
+        let end = match s.ended_at {
+            Some(e) => local(&e).format("%H:%M").to_string(),
+            None => format!("{} (open)", local(&s.last_activity).format("%H:%M")),
+        };
+        let _ = writeln!(out, "  {} - {end}", start.format("%Y-%m-%d %H:%M"));
+        let _ = writeln!(
+            out,
+            "  {} checkpoint{}",
+            s.checkpoints,
+            if s.checkpoints == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(out);
     }
     out
 }

@@ -9,6 +9,7 @@
 //! content, not by the watcher: a path that vanished and a path that appeared
 //! with the same content in one batch is one rename.
 
+pub mod checkpoint;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -43,6 +44,12 @@ impl Tracker {
             known: HashMap::new(),
             baseline,
         }
+    }
+
+    /// Replace the index baseline (after a commit) without forgetting what
+    /// was observed since.
+    pub fn reset_baseline(&mut self, baseline: HashMap<PathBuf, String>) {
+        self.baseline = baseline;
     }
 
     /// Feed the current hash of one path; returns an event when the content
@@ -241,6 +248,14 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
     watcher
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|e| TrailError::Git(format!("cannot watch {}: {e}", root.display())))?;
+    // HEAD and the index live in the worktree's git dir, branch refs in the
+    // common dir. Notifications from there only trigger a HEAD re-check.
+    for dir in [git_dir.clone(), repo.worktree.common_dir.join("refs")] {
+        if dir.is_dir() {
+            let _ = watcher.watch(&dir, RecursiveMode::Recursive);
+        }
+    }
+    let mut last_head = repo.head_id.to_string();
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -317,6 +332,25 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
         }
 
         let ts = Utc::now();
+        // Commit boundary: the watcher only says "something in .git moved";
+        // gix decides whether HEAD actually changed.
+        if let Ok(head) = current_head(repo) {
+            if head != last_head {
+                writer.record_commit(ts, &last_head, &head)?;
+                if !opts.quiet {
+                    println!(
+                        "{}  HEAD moved to {}",
+                        ts.with_timezone(&chrono::Local).format("%H:%M:%S"),
+                        &head[..head.len().min(7)]
+                    );
+                }
+                last_head = head;
+                // Everything committed is now the baseline for later edits.
+                if let Ok(baseline) = index_baseline(repo) {
+                    tracker.reset_baseline(baseline);
+                }
+            }
+        }
         let mut paths: Vec<PathBuf> = pending.into_iter().collect();
         paths.sort();
         let mut batch: Vec<(PathBuf, Option<String>)> = Vec::new();
@@ -356,6 +390,13 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn current_head(repo: &Repo) -> Result<String> {
+    repo.gix()
+        .head_id()
+        .map(|id| id.to_string())
+        .map_err(|e| TrailError::Git(e.to_string()))
 }
 
 fn describe(event: &RawEvent) -> String {

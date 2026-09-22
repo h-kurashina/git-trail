@@ -1,6 +1,6 @@
 //! Turns raw git facts into `Trail`s and reports.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -9,10 +9,12 @@ use crate::error::Result;
 use crate::git::diff::{self, ChangeKind, DiffTarget, FileStat, LineStats, StatusEntry};
 use crate::git::history;
 use crate::git::repository::{BaseRef, Repo};
+use crate::recorder::checkpoint::{build_checkpoints, Checkpoint};
+use crate::recorder::store::{self, SessionFile};
 use crate::trail::event::{Confidence, EventSource, TrailEvent, TrailEventType};
 use crate::trail::{
     kind_counts, DiffGroup, DiffReport, InspectCommit, InspectReport, RepositoryContext,
-    StatusReport, Trail, TrailSummary,
+    SessionSummary, SessionsReport, StatusReport, Trail, TrailSummary,
 };
 
 /// How much history to reconstruct.
@@ -165,6 +167,53 @@ pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
         }
     }
 
+    // 4. Recorded sessions: exact observations from `trail start`. Where a
+    //    checkpoint covers a file, the mtime-based guess for that file is
+    //    dropped so nothing is shown twice.
+    let since = merge_base_time(repo, base);
+    let checkpoints = recorded_checkpoints(repo, since)?;
+    let mut covered: HashMap<&Path, DateTime<Utc>> = HashMap::new();
+    for (cp, covered_until) in &checkpoints {
+        for change in &cp.changes {
+            let until = covered
+                .entry(change.path.as_path())
+                .or_insert(*covered_until);
+            *until = (*until).max(*covered_until);
+        }
+    }
+    events.retain(|e| {
+        if e.confidence != Confidence::Inferred {
+            return true;
+        }
+        let Some(path) = e.files.first() else {
+            return true;
+        };
+        match (covered.get(path.as_path()), e.timestamp) {
+            (Some(until), Some(ts)) => ts > *until + chrono::Duration::seconds(2),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    });
+    for (cp, _) in checkpoints {
+        events.push(TrailEvent {
+            timestamp: Some(cp.started_at),
+            files: cp.changes.iter().map(|c| c.path.clone()).collect(),
+            event_type: TrailEventType::Checkpoint {
+                id: cp.id,
+                session_id: cp.session_id,
+                title: cp.title,
+                annotation: cp.annotation,
+                bulk: cp.bulk,
+                hidden: cp.hidden,
+                changes: cp.changes,
+            },
+            source: EventSource::TrailRecorder,
+            confidence: Confidence::Exact,
+            stats: None,
+            staged: None,
+        });
+    }
+
     // Chronological order; events without a time sink to the end.
     events.sort_by(|a, b| match (a.timestamp, b.timestamp) {
         (Some(x), Some(y)) => x.cmp(&y),
@@ -184,6 +233,94 @@ pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
         repository: context(repo, base),
         events,
         summary,
+    })
+}
+
+fn merge_base_time(repo: &Repo, base: &BaseRef) -> Option<DateTime<Utc>> {
+    let commit = repo.gix().find_commit(base.merge_base).ok()?;
+    let time = commit.time().ok()?;
+    chrono::TimeZone::timestamp_opt(&Utc, time.seconds, 0).single()
+}
+
+/// Sessions that belong to this worktree, or that were recorded on this
+/// branch *and* whose starting commit is part of the current history. The
+/// second condition keeps a branch name that was deleted and later reused
+/// from dragging in an unrelated trail.
+fn sessions_for(repo: &Repo) -> Result<Vec<SessionFile>> {
+    let worktree_id = store::worktree_id(repo);
+    let branch = match &repo.head {
+        crate::git::repository::HeadState::Branch { name } => Some(name.clone()),
+        crate::git::repository::HeadState::Detached { .. } => None,
+    };
+    Ok(store::list_sessions(&repo.worktree.common_dir)?
+        .into_iter()
+        .filter(|s| {
+            s.header.worktree_id == worktree_id
+                || (branch.is_some()
+                    && s.header.branch == branch
+                    && s.header
+                        .start_head
+                        .as_deref()
+                        .is_some_and(|h| is_ancestor_of_head(repo, h)))
+        })
+        .collect())
+}
+
+/// True when `oid` is reachable from HEAD (or is HEAD). Unknown or garbage
+/// collected objects are not ancestors.
+fn is_ancestor_of_head(repo: &Repo, oid: &str) -> bool {
+    let Ok(id) = gix::ObjectId::from_hex(oid.as_bytes()) else {
+        return false;
+    };
+    if id == repo.head_id {
+        return true;
+    }
+    match repo.gix().merge_base(repo.head_id, id) {
+        Ok(base) => base.detach() == id,
+        Err(_) => false,
+    }
+}
+
+/// Checkpoints of the relevant sessions since the branch point, paired with
+/// the time until which their session is known to have been watching.
+fn recorded_checkpoints(
+    repo: &Repo,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<(Checkpoint, DateTime<Utc>)>> {
+    let mut out = Vec::new();
+    for session in sessions_for(repo)? {
+        // An open session (no end record) is assumed to still be watching.
+        let covered_until = session.ended_at.unwrap_or_else(Utc::now);
+        for cp in build_checkpoints(&session.header.session_id, &session.records) {
+            if since.is_some_and(|s| cp.ended_at < s) {
+                continue;
+            }
+            out.push((cp, covered_until));
+        }
+    }
+    Ok(out)
+}
+
+pub fn build_sessions(repo: &Repo) -> Result<SessionsReport> {
+    let sessions = store::list_sessions(&repo.worktree.common_dir)?
+        .into_iter()
+        .map(|s| SessionSummary {
+            checkpoints: build_checkpoints(&s.header.session_id, &s.records).len(),
+            last_activity: s.last_activity(),
+            worktree_exists: s.header.worktree_path.is_dir(),
+            session_id: s.header.session_id,
+            worktree_id: s.header.worktree_id,
+            worktree_path: s.header.worktree_path,
+            branch: s.header.branch,
+            started_at: s.header.started_at,
+            ended_at: s.ended_at,
+            events: s.events,
+            path: s.path,
+        })
+        .collect();
+    Ok(SessionsReport {
+        repository: repo.name.clone(),
+        sessions,
     })
 }
 
