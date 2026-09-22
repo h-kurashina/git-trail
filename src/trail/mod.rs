@@ -48,6 +48,15 @@ pub struct Trail {
     pub summary: TrailSummary,
 }
 
+impl Trail {
+    pub fn truncate_to_latest(&mut self, n: usize) {
+        if self.events.len() > n {
+            let drop = self.events.len() - n;
+            self.events.drain(..drop);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StatusCounts {
     pub modified: usize,
