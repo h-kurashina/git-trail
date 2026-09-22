@@ -27,6 +27,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             recorder::Options {
                 stop_after: stop_after.map(std::time::Duration::from_secs),
                 quiet,
+                base: cli.base.clone(),
             },
         )?);
     }

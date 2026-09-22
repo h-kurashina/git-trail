@@ -5,7 +5,9 @@
 //! the file's current content and comparing it with the last content we know
 //! about, so editor saves without changes, mtime-only touches and duplicate
 //! notifications never become events. The baseline for a path we have not
-//! seen yet is the blob recorded in the git index.
+//! seen yet is the blob recorded in the git index. Renames are recognised by
+//! content, not by the watcher: a path that vanished and a path that appeared
+//! with the same content in one batch is one rename.
 
 pub mod store;
 
@@ -22,12 +24,12 @@ use notify::{RecursiveMode, Watcher};
 
 use crate::error::{Result, TrailError};
 use crate::git::repository::Repo;
-use store::{RecordedEvent, RecordedKind, SessionHeader, SessionWriter};
+use store::{RawEvent, RawEventKind, SessionHeader, SessionWriter};
 
-/// Decides whether an observed path became a real change.
+/// Decides whether observed paths became real changes.
 ///
 /// Pure state machine: it never touches the filesystem itself, callers hand it
-/// the current content hash (`None` when the file is gone).
+/// the current content hash of each path (`None` when the file is gone).
 pub struct Tracker {
     /// Last content hash we recorded (or learned from the index) per path.
     known: HashMap<PathBuf, Option<String>>,
@@ -43,14 +45,14 @@ impl Tracker {
         }
     }
 
-    /// Feed the current hash of `path`; returns an event when the content
+    /// Feed the current hash of one path; returns an event when the content
     /// differs from what was known before.
     pub fn observe(
         &mut self,
         path: &Path,
         current: Option<String>,
         ts: DateTime<Utc>,
-    ) -> Option<RecordedEvent> {
+    ) -> Option<RawEvent> {
         let before = match self.known.get(path) {
             Some(known) => known.clone(),
             None => self.baseline.get(path).cloned(),
@@ -60,27 +62,86 @@ impl Tracker {
             return None;
         }
         let kind = match (&before, &current) {
-            (None, Some(_)) => RecordedKind::Added,
-            (Some(_), None) => RecordedKind::Deleted,
+            (None, Some(_)) => RawEventKind::Created,
+            (Some(_), None) => RawEventKind::Deleted,
             (None, None) => {
                 self.known.insert(path.to_path_buf(), None);
                 return None;
             }
-            (Some(_), Some(_)) => RecordedKind::Modified,
+            (Some(_), Some(_)) => RawEventKind::Modified,
         };
         self.known.insert(path.to_path_buf(), current.clone());
-        Some(RecordedEvent {
-            ts,
-            kind,
+        Some(RawEvent {
+            timestamp: ts,
             path: path.to_path_buf(),
+            kind,
+            from_path: None,
             before_hash: before,
             after_hash: current,
         })
     }
+
+    /// Feed a whole batch of paths observed together. Deletions and creations
+    /// with identical content are folded into one `Renamed` event.
+    pub fn observe_batch(
+        &mut self,
+        batch: Vec<(PathBuf, Option<String>)>,
+        ts: DateTime<Utc>,
+    ) -> Vec<RawEvent> {
+        let events: Vec<RawEvent> = batch
+            .into_iter()
+            .filter_map(|(path, hash)| self.observe(&path, hash, ts))
+            .collect();
+        pair_renames(events)
+    }
+}
+
+/// Fold `Deleted(a, hash h)` + `Created(b, hash h)` into `Renamed(a -> b)`.
+/// Only unambiguous 1:1 matches are paired; anything else stays as it is.
+fn pair_renames(events: Vec<RawEvent>) -> Vec<RawEvent> {
+    let mut deleted_by_hash: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut created_by_hash: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, e) in events.iter().enumerate() {
+        match (e.kind, &e.before_hash, &e.after_hash) {
+            (RawEventKind::Deleted, Some(h), _) => {
+                deleted_by_hash.entry(h.clone()).or_default().push(i)
+            }
+            (RawEventKind::Created, _, Some(h)) => {
+                created_by_hash.entry(h.clone()).or_default().push(i)
+            }
+            _ => {}
+        }
+    }
+    // created index -> deleted index
+    let mut pairs: HashMap<usize, usize> = HashMap::new();
+    for (hash, deleted) in &deleted_by_hash {
+        if let Some(created) = created_by_hash.get(hash) {
+            if deleted.len() == 1 && created.len() == 1 {
+                pairs.insert(created[0], deleted[0]);
+            }
+        }
+    }
+    let consumed: HashSet<usize> = pairs.values().copied().collect();
+    let mut out = Vec::with_capacity(events.len());
+    for (i, mut e) in events.iter().cloned().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        if let Some(deleted_idx) = pairs.get(&i) {
+            e.kind = RawEventKind::Renamed;
+            e.from_path = Some(events[*deleted_idx].path.clone());
+            e.before_hash = events[*deleted_idx].before_hash.clone();
+        }
+        out.push(e);
+    }
+    out
 }
 
 /// Git blob id of the file's content, `None` if it does not exist or is not a
 /// regular file (directories and sockets are not tracked).
+///
+/// SHA-1 over the blob is not chosen for security but because it is the id
+/// `git hash-object` would produce, which a later snapshot phase can reuse.
 pub fn blob_hash(path: &Path, hash_kind: gix::hash::Kind) -> Option<String> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     let data = if meta.file_type().is_symlink() {
@@ -118,12 +179,40 @@ fn index_baseline(repo: &Repo) -> Result<HashMap<PathBuf, String>> {
 pub struct Options {
     pub stop_after: Option<Duration>,
     pub quiet: bool,
+    /// `--base` as given on the command line, used for the header only.
+    pub base: Option<String>,
 }
 
 /// How long to wait for more notifications before hashing a batch. Editors
 /// and agents write several files in quick succession; one batch means one
-/// hash per file instead of one per notification.
+/// hash per file instead of one per notification, and lets renames pair up.
 const BATCH_WINDOW: Duration = Duration::from_millis(250);
+
+pub fn build_header(repo: &Repo, base: Option<&str>, started_at: DateTime<Utc>) -> SessionHeader {
+    let base_commit = repo
+        .resolve_base(base)
+        .ok()
+        .map(|b| b.merge_base.to_string());
+    SessionHeader {
+        version: store::FORMAT_VERSION,
+        session_id: store::new_session_id(started_at),
+        repository_root: repo
+            .worktree
+            .common_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| repo.worktree.common_dir.clone()),
+        worktree_id: store::worktree_id(repo),
+        worktree_path: repo.workdir().to_path_buf(),
+        branch: match &repo.head {
+            crate::git::repository::HeadState::Branch { name } => Some(name.clone()),
+            crate::git::repository::HeadState::Detached { .. } => None,
+        },
+        base_commit,
+        start_head: Some(repo.head_id.to_string()),
+        started_at,
+    }
+}
 
 pub fn run(repo: &Repo, opts: Options) -> Result<()> {
     let root = repo.workdir().to_path_buf();
@@ -132,15 +221,7 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
     let hash_kind = repo.gix().object_hash();
 
     let started_at = Utc::now();
-    let header = SessionHeader {
-        version: store::FORMAT_VERSION,
-        session_id: store::new_session_id(started_at),
-        worktree_id: repo.worktree.id.clone().unwrap_or_else(|| "main".into()),
-        worktree_path: root.clone(),
-        branch: repo.head.label(),
-        base_commit: repo.head_id.to_string(),
-        started_at,
-    };
+    let header = build_header(repo, opts.base.as_deref(), started_at);
     let mut writer = SessionWriter::create(&store::session_dir(repo), &header)?;
     let mut tracker = Tracker::new(index_baseline(repo)?);
 
@@ -171,9 +252,19 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
     if !opts.quiet {
         println!();
         println!("Recording development trail...");
-        println!("Worktree: {}", header.branch);
-        println!("Session: {}", header.session_id);
-        println!("Log: {}", writer.path().display());
+        println!();
+        println!("Repository");
+        println!("  {}", repo.name);
+        println!();
+        println!("Worktree");
+        println!("  {}", repo.head.label());
+        if repo.worktree.id.is_some() {
+            println!("  {}", root.display());
+        }
+        println!();
+        println!("Session");
+        println!("  {}", header.session_id);
+        println!("  {}", writer.path().display());
         println!();
         println!("Press Ctrl+C to stop.");
         println!();
@@ -226,9 +317,10 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
         }
 
         let ts = Utc::now();
-        let mut batch: Vec<PathBuf> = pending.into_iter().collect();
-        batch.sort();
-        for abs in batch {
+        let mut paths: Vec<PathBuf> = pending.into_iter().collect();
+        paths.sort();
+        let mut batch: Vec<(PathBuf, Option<String>)> = Vec::new();
+        for abs in paths {
             let Ok(rel) = abs.strip_prefix(&root) else {
                 continue;
             };
@@ -241,22 +333,12 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
             {
                 continue;
             }
-            let current = blob_hash(&abs, hash_kind);
-            if let Some(event) = tracker.observe(rel, current, ts) {
-                writer.record(&event)?;
-                if !opts.quiet {
-                    let label = match event.kind {
-                        RecordedKind::Added => "added",
-                        RecordedKind::Modified => "modified",
-                        RecordedKind::Deleted => "deleted",
-                    };
-                    println!(
-                        "{}  {} {}",
-                        event.ts.with_timezone(&chrono::Local).format("%H:%M:%S"),
-                        label,
-                        event.path.display()
-                    );
-                }
+            batch.push((rel.to_path_buf(), blob_hash(&abs, hash_kind)));
+        }
+        for event in tracker.observe_batch(batch, ts) {
+            writer.record(&event)?;
+            if !opts.quiet {
+                println!("{}", describe(&event));
             }
         }
     }
@@ -274,6 +356,27 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn describe(event: &RawEvent) -> String {
+    let time = event
+        .timestamp
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S");
+    match event.kind {
+        RawEventKind::Created => format!("{time}  created {}", event.path.display()),
+        RawEventKind::Modified => format!("{time}  modified {}", event.path.display()),
+        RawEventKind::Deleted => format!("{time}  deleted {}", event.path.display()),
+        RawEventKind::Renamed => format!(
+            "{time}  renamed {} -> {}",
+            event
+                .from_path
+                .as_deref()
+                .unwrap_or(Path::new("?"))
+                .display(),
+            event.path.display()
+        ),
+    }
 }
 
 fn collect_paths(event: notify::Result<notify::Event>, into: &mut HashSet<PathBuf>) {
@@ -308,7 +411,7 @@ mod tests {
         let e = t
             .observe(Path::new("src/a.rs"), Some("h2".into()), Utc::now())
             .unwrap();
-        assert_eq!(e.kind, RecordedKind::Modified);
+        assert_eq!(e.kind, RawEventKind::Modified);
         assert_eq!(e.before_hash.as_deref(), Some("h1"));
         assert_eq!(e.after_hash.as_deref(), Some("h2"));
         // Same content again: deduplicated.
@@ -323,19 +426,62 @@ mod tests {
     }
 
     #[test]
-    fn add_then_delete() {
+    fn create_then_delete() {
         let mut t = tracker();
         let e = t
             .observe(Path::new("new.txt"), Some("x".into()), Utc::now())
             .unwrap();
-        assert_eq!(e.kind, RecordedKind::Added);
+        assert_eq!(e.kind, RawEventKind::Created);
         assert!(e.before_hash.is_none());
         let e = t.observe(Path::new("new.txt"), None, Utc::now()).unwrap();
-        assert_eq!(e.kind, RecordedKind::Deleted);
+        assert_eq!(e.kind, RawEventKind::Deleted);
         assert!(e.after_hash.is_none());
         // Notification for a path that never existed (e.g. temp file already gone).
         assert!(t
             .observe(Path::new("ghost.tmp"), None, Utc::now())
             .is_none());
+    }
+
+    #[test]
+    fn rename_is_detected_by_content() {
+        let mut t = tracker();
+        let events = t.observe_batch(
+            vec![
+                (PathBuf::from("src/a.rs"), None),
+                (PathBuf::from("src/b.rs"), Some("h1".into())),
+                (PathBuf::from("other.txt"), Some("zz".into())),
+            ],
+            Utc::now(),
+        );
+        assert_eq!(events.len(), 2);
+        let renamed = events
+            .iter()
+            .find(|e| e.kind == RawEventKind::Renamed)
+            .unwrap();
+        assert_eq!(renamed.path, PathBuf::from("src/b.rs"));
+        assert_eq!(renamed.from_path.as_deref(), Some(Path::new("src/a.rs")));
+        assert_eq!(renamed.before_hash.as_deref(), Some("h1"));
+        assert_eq!(renamed.after_hash.as_deref(), Some("h1"));
+        assert!(events
+            .iter()
+            .any(|e| e.kind == RawEventKind::Created && e.path == Path::new("other.txt")));
+    }
+
+    #[test]
+    fn ambiguous_renames_stay_separate() {
+        let mut baseline = HashMap::new();
+        baseline.insert(PathBuf::from("a"), "same".to_string());
+        baseline.insert(PathBuf::from("b"), "same".to_string());
+        let mut t = Tracker::new(baseline);
+        let events = t.observe_batch(
+            vec![
+                (PathBuf::from("a"), None),
+                (PathBuf::from("b"), None),
+                (PathBuf::from("c"), Some("same".into())),
+            ],
+            Utc::now(),
+        );
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|e| e.kind != RawEventKind::Renamed));
     }
 }
