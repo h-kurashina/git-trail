@@ -586,3 +586,195 @@ fn start_in_linked_worktree_stores_under_common_dir() {
     assert_eq!(lines[0]["repository_root"], f.root.to_str().unwrap());
     assert_eq!(lines.last().unwrap()["kind"], "end");
 }
+
+/// Records a session in `dir`: modify, commit, modify. Returns after the
+/// recorder has stopped.
+fn record_session_with_commit(dir: &Path) {
+    let child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .args(["start", "--stop-after", "7", "--quiet"])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    write(dir, "src/lib.rs", "fn a() {}\nfn b() {}\n// session one\n");
+    write(dir, "src/one.rs", "one\n");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "recorded commit"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    write(dir, "src/lib.rs", "fn a() {}\nfn b() {}\n// session two\n");
+    write(dir, "src/two.rs", "two\n");
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn history_integrates_recorded_checkpoints_around_commits() {
+    let f = Fixture::with_feature("main");
+    record_session_with_commit(&f.root);
+    // A file touched after the session ended keeps its mtime-based event.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    write(&f.root, "later.txt", "after the session\n");
+
+    let json = trail_json(&f.root, &["history"]);
+    let events = json["events"].as_array().unwrap();
+    let kinds: Vec<String> = events
+        .iter()
+        .filter(|e| e["type"] == "checkpoint" || e["type"] == "commit")
+        .map(|e| {
+            if e["type"] == "commit" {
+                format!("commit:{}", e["summary"].as_str().unwrap())
+            } else {
+                "checkpoint".to_string()
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "commit:add feature module",
+            "checkpoint",
+            "commit:recorded commit",
+            "checkpoint"
+        ],
+        "{events:#?}"
+    );
+
+    let checkpoints: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["type"] == "checkpoint")
+        .collect();
+    assert!(checkpoints
+        .iter()
+        .all(|c| c["source"] == "trail_recorder" && c["confidence"] == "exact"));
+    assert!(checkpoints[0]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["path"] == "src/one.rs" && c["kind"] == "created"));
+    assert!(checkpoints[1]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["path"] == "src/lib.rs" && c["kind"] == "modified"));
+
+    // Inferred working tree events for recorded files are replaced ...
+    let inferred: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["confidence"] == "inferred")
+        .collect();
+    assert!(
+        !inferred.iter().any(|e| e["files"][0] == "src/lib.rs"),
+        "{inferred:?}"
+    );
+    assert!(
+        !inferred.iter().any(|e| e["files"][0] == "src/two.rs"),
+        "{inferred:?}"
+    );
+    // ... but a change made after the recorder stopped is still inferred.
+    assert!(
+        inferred.iter().any(|e| e["files"][0] == "later.txt"),
+        "{inferred:?}"
+    );
+
+    let text = trail_ok(&f.root, &["history"]);
+    assert!(text.contains("Session "));
+    assert!(text.contains("+ src/one.rs"));
+    assert!(text.contains("~ src/lib.rs"));
+    assert!(!text.contains("Modified src/lib.rs"));
+    assert!(text.contains("Added later.txt"));
+
+    // The overview shows checkpoints too.
+    let overview = trail_ok(&f.root, &[]);
+    assert!(overview.contains("1 created, 1 modified"));
+}
+
+#[test]
+fn sessions_are_listed_after_the_worktree_is_removed() {
+    let f = Fixture::with_feature("main");
+    let wt_dir = TempDir::new().unwrap();
+    let wt = wt_dir.path().join("agent-wt");
+    git(
+        &f.root,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "agent"],
+    );
+    let wt = wt.canonicalize().unwrap();
+    record_session_with_commit(&wt);
+
+    let json = trail_json(&f.root, &["sessions"]);
+    assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(json["sessions"][0]["worktree_exists"], true);
+    assert_eq!(json["sessions"][0]["checkpoints"], 2);
+
+    git(
+        &f.root,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    assert!(!wt.exists());
+    assert!(!f.root.join(".git/worktrees/agent-wt").exists());
+
+    let json = trail_json(&f.root, &["sessions"]);
+    let s = &json["sessions"][0];
+    assert_eq!(s["worktree_exists"], false);
+    assert_eq!(s["branch"], "agent");
+    assert_eq!(s["worktree_id"], "agent-wt");
+    assert_eq!(s["checkpoints"], 2);
+    assert!(s["ended_at"].is_string());
+    let text = trail_ok(&f.root, &["sessions"]);
+    assert!(text.contains("Development Sessions"));
+    assert!(text.contains("agent  (worktree removed)"));
+    assert!(text.contains("2 checkpoints"));
+
+    // The branch still exists, so its trail can be viewed from the main
+    // worktree after checking it out.
+    git(&f.root, &["checkout", "-q", "agent"]);
+    let history = trail_json(&f.root, &["history"]);
+    assert_eq!(
+        history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "checkpoint")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn sessions_survive_corrupt_and_truncated_logs() {
+    let f = Fixture::with_feature("main");
+    let dir = f.root.join(".git/trail/worktrees/main/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("session-good.jsonl"),
+        concat!(
+            "{\"kind\":\"session\",\"version\":1,\"session_id\":\"good\",\"repository_root\":\"/r\",\"worktree_id\":\"main\",\"worktree_path\":\"/r\",\"branch\":\"feature\",\"base_commit\":null,\"start_head\":null,\"started_at\":\"2026-09-22T01:00:00Z\"}\n",
+            "{\"kind\":\"event\",\"timestamp\":\"2026-09-22T01:00:01Z\",\"path\":\"a.rs\",\"type\":\"modified\",\"before_hash\":\"1\",\"after_hash\":\"2\"}\n",
+            "this line is garbage\n",
+            "{\"kind\":\"event\",\"timestamp\":\"2026-09-22T01:00:02Z\",\"path\":\"b.rs\",\"type\":\"created\",\"before_hash\":null,\"after_hash\":\"3\"}\n",
+            "{\"kind\":\"end\",\"ended_at\":\"2026-09-22T01:00:0"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("session-bad.jsonl"), "not a session at all\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "ignored\n").unwrap();
+
+    let json = trail_json(&f.root, &["sessions"]);
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], "good");
+    assert_eq!(sessions[0]["events"], 2);
+    assert_eq!(sessions[0]["checkpoints"], 1);
+    assert!(
+        sessions[0]["ended_at"].is_null(),
+        "truncated end line is not an end"
+    );
+    let text = trail_ok(&f.root, &["sessions"]);
+    assert!(text.contains("(open)"));
+}
