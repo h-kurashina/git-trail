@@ -47,6 +47,8 @@ pub enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// List recorded development sessions (including removed worktrees)
+    Sessions,
     /// Show change information for a single file
     Inspect {
         /// File path, relative to the current directory or the repository root

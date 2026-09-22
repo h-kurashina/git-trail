@@ -120,6 +120,29 @@ pub struct InspectCommit {
     pub on_branch: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub worktree_id: String,
+    pub worktree_path: PathBuf,
+    /// False when the worktree directory no longer exists.
+    pub worktree_exists: bool,
+    pub branch: Option<String>,
+    pub started_at: DateTime<Utc>,
+    /// `None` while the session is still open (or the recorder crashed).
+    pub ended_at: Option<DateTime<Utc>>,
+    pub last_activity: DateTime<Utc>,
+    pub events: usize,
+    pub checkpoints: usize,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionsReport {
+    pub repository: String,
+    pub sessions: Vec<SessionSummary>,
+}
+
 /// Helper used by several reports.
 pub fn kind_counts(entries: &[StatusEntry]) -> StatusCounts {
     let mut counts = StatusCounts::default();
