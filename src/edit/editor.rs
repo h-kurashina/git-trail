@@ -16,13 +16,8 @@ impl Editor {
     pub fn resolve() -> Result<Self> {
         for var in ["VISUAL", "EDITOR"] {
             if let Some(value) = std::env::var_os(var) {
-                let value = value.to_string_lossy();
-                let mut parts = value.split_whitespace().map(String::from);
-                if let Some(program) = parts.next() {
-                    return Ok(Editor {
-                        program,
-                        args: parts.collect(),
-                    });
+                if let Some(editor) = Self::parse(&value.to_string_lossy(), var)? {
+                    return Ok(editor);
                 }
             }
         }
@@ -34,6 +29,19 @@ impl Editor {
             });
         }
         Err(TrailError::NoEditor)
+    }
+
+    /// Parse an `$EDITOR`-style value with shell word rules, so quoted
+    /// arguments such as `nvim --cmd "set signcolumn=no"` survive. An empty
+    /// value means "unset". Unbalanced quotes are an error.
+    pub fn parse(value: &str, var: &str) -> Result<Option<Self>> {
+        let words = shell_words::split(value)
+            .map_err(|e| TrailError::EditorFailed(format!("cannot parse ${var}={value:?}: {e}")))?;
+        let mut words = words.into_iter();
+        Ok(words.next().map(|program| Editor {
+            program,
+            args: words.collect(),
+        }))
     }
 
     pub fn describe(&self) -> String {
@@ -70,4 +78,22 @@ fn which(program: &str) -> bool {
         let candidate = dir.join(program);
         candidate.is_file() || (cfg!(windows) && dir.join(format!("{program}.exe")).is_file())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_quoted_arguments() {
+        let e = Editor::parse(r#"nvim --cmd "set signcolumn=no" -f"#, "EDITOR")
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.program, "nvim");
+        assert_eq!(e.args, vec!["--cmd", "set signcolumn=no", "-f"]);
+        let e = Editor::parse("code --wait", "VISUAL").unwrap().unwrap();
+        assert_eq!(e.args, vec!["--wait"]);
+        assert!(Editor::parse("   ", "EDITOR").unwrap().is_none());
+        assert!(Editor::parse(r#"nvim --cmd "unbalanced"#, "EDITOR").is_err());
+    }
 }
