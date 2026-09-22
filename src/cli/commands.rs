@@ -10,6 +10,7 @@ use serde::Serialize;
 use super::{Cli, Command};
 use crate::display::terminal;
 use crate::git::repository::Repo;
+use crate::recorder;
 use crate::trail::builder;
 
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -18,9 +19,22 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         None => std::env::current_dir()?,
     };
     let repo = Repo::discover(&start)?;
-    let base = repo.resolve_base(cli.base.as_deref())?;
 
+    // Recording does not need a base branch; everything else does.
+    if let Some(Command::Start { stop_after, quiet }) = cli.command {
+        return Ok(recorder::run(
+            &repo,
+            recorder::Options {
+                stop_after: stop_after.map(std::time::Duration::from_secs),
+                quiet,
+                base: cli.base.clone(),
+            },
+        )?);
+    }
+
+    let base = repo.resolve_base(cli.base.as_deref())?;
     match cli.command {
+        Some(Command::Start { .. }) => unreachable!("handled above"),
         None => {
             let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
             emit(cli.json, &trail, terminal::render_trail)

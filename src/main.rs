@@ -8,6 +8,7 @@ mod cli;
 mod display;
 mod error;
 mod git;
+mod recorder;
 mod trail;
 
 fn main() {

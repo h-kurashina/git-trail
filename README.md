@@ -28,6 +28,7 @@ trail status
 trail history
 trail diff
 trail inspect src/auth/service.ts
+trail start
 ```
 
 Global options:
@@ -93,6 +94,56 @@ Status, line stats (vs HEAD and vs base) and the commits that touched a single
 file, following renames. Commits that are on the current branch but not on the
 base are marked with `*`.
 
+### `trail start`
+
+Records what changes in the worktree while you (or a coding agent) work, until
+Ctrl+C. This is the first information trail holds that Git does not.
+
+```text
+$ trail start
+
+Recording development trail...
+
+Repository
+  my-project
+
+Worktree
+  feature/auth
+
+Session
+  01K5V9W4YV7A3ZK6QH0M8R2B4C
+
+Press Ctrl+C to stop.
+
+14:19:27  modified src/auth/service.ts
+14:19:28  created tests/auth.test.ts
+14:19:40  renamed src/auth/util.ts -> src/auth/helpers.ts
+```
+
+Only real content changes are recorded: every notification is verified by
+hashing the file and comparing it with the last known content, so editor
+saves without changes and mtime-only touches are dropped. Renames are
+recognised by content (a path that vanished and a path that appeared with the
+same content), not by trusting the watcher. Paths matched by `.gitignore`,
+`.git/info/exclude` or the global ignore file, and everything under `.git`,
+are skipped.
+
+Sessions are append-only JSONL files under
+`<common git dir>/trail/worktrees/<worktree id>/sessions/`, so they survive
+`git worktree remove`. Each event carries the git blob id of the content
+before and after the change:
+
+```json
+{"kind":"session","version":1,"session_id":"01K5V9W4YV7A3ZK6QH0M8R2B4C","repository_root":"/…/my-project","worktree_id":"main","worktree_path":"/…/my-project","branch":"feature/auth","base_commit":"17c881b…","start_head":"2b86c0e…","started_at":"…"}
+{"kind":"event","timestamp":"…","path":"src/auth/service.ts","type":"modified","before_hash":"70e5878…","after_hash":"40fcf65…"}
+{"kind":"event","timestamp":"…","path":"src/auth/helpers.ts","type":"renamed","from_path":"src/auth/util.ts","before_hash":"9a1…","after_hash":"9a1…"}
+{"kind":"end","ended_at":"…","events":2}
+```
+
+`--stop-after <seconds>` stops automatically, `--quiet` suppresses the live
+output. Recorded sessions are not yet shown by `trail history`; that is the
+next step.
+
 ## How it works
 
 trail never talks to the network and never sends anything anywhere. It reads:
@@ -101,6 +152,7 @@ trail never talks to the network and never sends anything anywhere. It reads:
 * the HEAD reflog
 * the index and working tree (`git status`, `git diff --numstat`)
 * file modification times
+* sessions recorded by `trail start`
 
 Every event carries a `source` and a `confidence`. Commit and reflog times are
 exact. Working tree events only have the file's mtime, which is recorded as
