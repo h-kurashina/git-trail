@@ -10,6 +10,7 @@ mod edit;
 mod error;
 mod git;
 mod recorder;
+mod review;
 mod trail;
 
 fn main() {
