@@ -6,6 +6,7 @@
 //! Rust is not worth the complexity for an MVP. Every CLI call lives in this
 //! module so the boundary is easy to see and easy to replace later.
 
+pub mod baseline;
 pub mod diff;
 pub mod history;
 pub mod repository;

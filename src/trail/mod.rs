@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::git::baseline::Baseline;
 use crate::git::diff::{ChangeKind, FileStat, LineStats, StatusEntry};
-use crate::git::history::FileCommit;
+use crate::git::history::{CommitInfo, FileCommit};
 use crate::git::repository::HeadState;
 use crate::git::worktree::WorktreeInfo;
 use event::TrailEvent;
@@ -26,8 +27,39 @@ pub struct RepositoryContext {
     pub head: HeadState,
     pub base: String,
     pub merge_base: String,
+    /// Where this view of the trail starts.
+    pub since: Baseline,
     pub worktree: WorktreeInfo,
     pub shallow: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangedFileKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedFile {
+    #[serde(flatten)]
+    pub stat: FileStat,
+    /// Relative to the baseline commit.
+    pub kind: ChangedFileKind,
+    /// Working tree state, `None` when the change is already committed.
+    pub status: Option<StatusEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangesReport {
+    pub repository: RepositoryContext,
+    pub commits: Vec<CommitInfo>,
+    pub checkpoints: usize,
+    pub files: Vec<ChangedFile>,
+    pub counts: StatusCounts,
+    pub stats: LineStats,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
