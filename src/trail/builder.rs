@@ -14,6 +14,7 @@ use crate::recorder::checkpoint::{build_checkpoints, Checkpoint};
 use crate::recorder::metadata::Metadata;
 use crate::recorder::snapshot;
 use crate::recorder::store::{self, SessionFile};
+use crate::trail::attach;
 use crate::trail::event::{Confidence, EventSource, TrailEvent, TrailEventType};
 use crate::trail::{
     kind_counts, ChangedFile, ChangedFileKind, ChangesReport, DiffGroup, DiffReport, InspectCommit,
@@ -51,7 +52,7 @@ fn context(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> RepositoryContex
 /// Line stats of `rev`..working tree, including untracked files (git leaves
 /// them out of a diff, so they are counted as pure additions).
 fn stats_since(repo: &Repo, rev: &str, entries: &[StatusEntry]) -> Result<Vec<FileStat>> {
-    let mut stats = diff::numstat(repo.workdir(), rev, &[])?;
+    let mut stats = repo.numstat(rev, &[])?;
     stats.extend(diff::untracked_stats(repo.workdir(), entries));
     Ok(stats)
 }
@@ -78,7 +79,7 @@ pub fn build_trail(
     baseline: &Baseline,
     scope: Scope,
 ) -> Result<Trail> {
-    let entries = diff::status(repo.workdir())?;
+    let entries = repo.status()?;
     let commits = history::commits_between(repo.gix(), repo.head_id, baseline.start)?;
     let head_stats = stats_since_head(repo, &entries)?;
     let base_stats = stats_since_base(repo, base, &entries)?;
@@ -203,7 +204,22 @@ pub fn build_trail(
             (None, _) => true,
         }
     });
+    let identity_of = |id: &str| {
+        gix::ObjectId::from_hex(id.as_bytes())
+            .ok()
+            .and_then(|oid| history::identity(repo.gix(), oid))
+    };
+    let mut checkpoint_count = 0;
+    let mut uncommitted = 0;
     for (cp, _) in checkpoints {
+        let (commit, attachment) =
+            attach::attach(&commits, cp.boundary.as_ref(), cp.ended_at, &identity_of);
+        if !cp.hidden {
+            checkpoint_count += 1;
+            if commit.is_none() {
+                uncommitted += 1;
+            }
+        }
         events.push(TrailEvent {
             timestamp: Some(cp.started_at),
             files: cp.changes.iter().map(|c| c.path.clone()).collect(),
@@ -214,6 +230,9 @@ pub fn build_trail(
                 annotation: cp.annotation,
                 bulk: cp.bulk,
                 hidden: cp.hidden,
+                boundary: cp.boundary,
+                commit,
+                attachment,
                 changes: cp.changes,
             },
             source: EventSource::TrailRecorder,
@@ -236,6 +255,9 @@ pub fn build_trail(
     let base_total = LineStats::sum(&base_stats);
     let summary = TrailSummary {
         changes: events.iter().filter(|e| e.is_change()).count(),
+        commits: commits.len(),
+        checkpoints: checkpoint_count,
+        uncommitted_checkpoints: uncommitted,
         files_changed: base_stats.len(),
         additions: base_total.additions,
         deletions: base_total.deletions,
@@ -270,24 +292,10 @@ fn sessions_for(repo: &Repo) -> Result<Vec<SessionFile>> {
                     && s.header
                         .start_head
                         .as_deref()
-                        .is_some_and(|h| is_ancestor_of_head(repo, h)))
+                        .and_then(|h| gix::ObjectId::from_hex(h.as_bytes()).ok())
+                        .is_some_and(|h| repo.is_ancestor(h, repo.head_id)))
         })
         .collect())
-}
-
-/// True when `oid` is reachable from HEAD (or is HEAD). Unknown or garbage
-/// collected objects are not ancestors.
-fn is_ancestor_of_head(repo: &Repo, oid: &str) -> bool {
-    let Ok(id) = gix::ObjectId::from_hex(oid.as_bytes()) else {
-        return false;
-    };
-    if id == repo.head_id {
-        return true;
-    }
-    match repo.gix().merge_base(repo.head_id, id) {
-        Ok(base) => base.detach() == id,
-        Err(_) => false,
-    }
 }
 
 /// A checkpoint plus the time until which its session kept watching.
@@ -386,7 +394,7 @@ pub fn build_sessions(repo: &Repo) -> Result<SessionsReport> {
 /// `trail changes`: commits, files and recorded checkpoints since the baseline.
 /// Working tree changes (staged, unstaged, untracked) are always included.
 pub fn build_changes(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> Result<ChangesReport> {
-    let entries = diff::status(repo.workdir())?;
+    let entries = repo.status()?;
     let commits = history::commits_between(repo.gix(), repo.head_id, baseline.start)?;
     let stats = stats_since(repo, &baseline.start.to_string(), &entries)?;
     let baseline_tree = repo
@@ -433,7 +441,7 @@ pub fn build_changes(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> Result
 }
 
 pub fn build_status(repo: &Repo, base: &BaseRef) -> Result<StatusReport> {
-    let entries = diff::status(repo.workdir())?;
+    let entries = repo.status()?;
     let stats = LineStats::sum(&stats_since_head(repo, &entries)?);
     let commits_ahead = history::commits_between(repo.gix(), repo.head_id, base.merge_base)?.len();
     Ok(StatusReport {
@@ -446,7 +454,7 @@ pub fn build_status(repo: &Repo, base: &BaseRef) -> Result<StatusReport> {
 }
 
 pub fn build_diff(repo: &Repo, base: &BaseRef) -> Result<DiffReport> {
-    let entries = diff::status(repo.workdir())?;
+    let entries = repo.status()?;
     let stats = stats_since_base(repo, base, &entries)?;
 
     let mut groups: BTreeMap<String, Vec<FileStat>> = BTreeMap::new();
@@ -491,7 +499,7 @@ pub fn build_inspect(
     let rel = PathBuf::from(rel_str);
     let abs = repo.workdir().join(&rel);
 
-    let entries = diff::status(repo.workdir())?;
+    let entries = repo.status()?;
     let status = entries.iter().find(|e| e.path == rel).cloned();
     let exists = abs.exists();
 
@@ -516,8 +524,8 @@ pub fn build_inspect(
     } else {
         let merge_base = base.merge_base.to_string();
         (
-            pick(diff::numstat(repo.workdir(), "HEAD", &[&rel])?),
-            pick(diff::numstat(repo.workdir(), &merge_base, &[&rel])?),
+            pick(repo.numstat("HEAD", &[&rel])?),
+            pick(repo.numstat(&merge_base, &[&rel])?),
         )
     };
 

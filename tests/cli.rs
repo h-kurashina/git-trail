@@ -113,7 +113,8 @@ fn works_in_a_normal_repository() {
     let f = Fixture::with_feature("main").dirty();
     let out = trail_ok(&f.root, &[]);
     assert!(out.contains("Development Trail"));
-    assert!(out.contains("Branch\n  feature"));
+    assert!(out.contains("Worktree\n  feature"));
+    assert!(out.contains("Commits\n  1"));
     assert!(out.contains("Base\n  main"));
     assert!(out.contains("add feature module"));
     assert!(out.contains("Modified src/lib.rs"));
@@ -1427,64 +1428,113 @@ fn baseline_after_amend_uses_the_common_ancestor() {
 }
 
 #[test]
-fn review_lists_checkpoints_and_shows_per_checkpoint_diffs() {
+fn review_is_commit_centric_with_checkpoints_under_their_commit() {
     let f = Fixture::with_feature("main");
     record_session_with_commit(&f.root);
 
     let json = trail_json(&f.root, &["review"]);
-    let cps = json["checkpoints"].as_array().unwrap();
-    assert_eq!(cps.len(), 2, "{json:#?}");
-    assert_eq!(cps[0]["number"], 1);
-    assert_eq!(cps[1]["number"], 2);
-    let files1 = cps[0]["files"].as_array().unwrap();
-    let lib1 = files1.iter().find(|x| x["path"] == "src/lib.rs").unwrap();
-    assert_eq!(lib1["kind"], "modified");
-    assert_eq!(lib1["additions"], 1);
-    assert_eq!(lib1["deletions"], 0);
-    assert_eq!(lib1["snapshot"], true);
-    let one = files1.iter().find(|x| x["path"] == "src/one.rs").unwrap();
-    assert_eq!(one["kind"], "created");
-    assert_eq!(one["additions"], 1);
+    assert_eq!(json["version"], 2);
+    let sections = json["sections"].as_array().unwrap();
+    assert_eq!(sections.len(), 3, "{json:#?}");
+    // [1] a commit made before the recorder ran: a fact, no checkpoints.
+    assert_eq!(sections[0]["kind"], "commit");
+    assert_eq!(sections[0]["summary"], "add feature module");
+    assert_eq!(sections[0]["checkpoints"].as_array().unwrap().len(), 0);
+    assert_eq!(sections[0]["files"][0]["path"], "src/feature.rs");
+    assert_eq!(sections[0]["files"][0]["kind"], "added");
+    // [2] the commit the recorder watched: its checkpoint is attached with
+    // a recorded boundary.
+    assert_eq!(sections[1]["summary"], "recorded commit");
+    let cps2 = sections[1]["checkpoints"].as_array().unwrap();
+    assert_eq!(cps2.len(), 1);
+    assert_eq!(cps2[0]["label"], "2.1");
+    assert_eq!(cps2[0]["attachment"], "recorded");
+    let files = cps2[0]["files"].as_array().unwrap();
+    let lib = files.iter().find(|x| x["path"] == "src/lib.rs").unwrap();
+    assert_eq!(lib["kind"], "modified");
+    assert_eq!(lib["additions"], 1);
+    assert_eq!(lib["snapshot"], true);
+    // Commit diff of the same commit: parent tree -> commit tree.
+    let commit_files = sections[1]["files"].as_array().unwrap();
+    assert_eq!(commit_files.len(), 2);
+    assert_eq!(sections[1]["stats"]["additions"], 2);
+    // [3] the working tree holds the uncommitted checkpoint and git's view.
+    assert_eq!(sections[2]["kind"], "working_tree");
+    assert_eq!(sections[2]["checkpoints"][0]["label"], "3.1");
+    assert!(sections[2]["checkpoints"][0]["attachment"].is_null());
+    assert_eq!(sections[2]["unstaged"], 1);
+    assert_eq!(sections[2]["untracked"], 1);
+    // Version 1 fields are still there.
+    assert_eq!(json["checkpoints"].as_array().unwrap().len(), 2);
     assert_eq!(json["files_changed"], 3);
-    assert_eq!(json["stats"]["additions"], 4);
-    assert_eq!(json["stats"]["deletions"], 1);
+    assert_eq!(json["summary"]["commits"], 2);
+    assert_eq!(json["summary"]["uncommitted_checkpoints"], 1);
 
     let text = trail_ok(&f.root, &["review"]);
-    assert!(text.contains("[1] Checkpoint 1"));
-    assert!(text.contains("[2] Checkpoint 2"));
-    assert!(text.contains("~ src/lib.rs  +1"));
-    assert!(text.contains("+ src/one.rs  +1"));
-    assert!(text.contains("2 checkpoints, 3 files, +4 -1"));
-
-    // One checkpoint, by number and by id.
-    let one_text = trail_ok(&f.root, &["review", "2"]);
-    assert!(one_text.contains("[2] Checkpoint 2"));
-    assert!(one_text.contains("+ src/two.rs  +1"));
-    let by_id = trail_json(&f.root, &["review", cps[1]["id"].as_str().unwrap()]);
-    assert_eq!(by_id["number"], 2);
-
-    // Per-checkpoint diff: what checkpoint 2 changed in src/lib.rs is the
-    // step from "session one" to "session two", not baseline..HEAD.
-    let diff2 = trail_ok(&f.root, &["review", "2", "src/lib.rs"]);
     assert!(
-        diff2.contains("--- a/src/lib.rs\n+++ b/src/lib.rs\n"),
-        "{diff2}"
+        text.contains("[1] ") && text.contains(" add feature module\n"),
+        "{text}"
     );
+    assert!(text.contains("    no recorded checkpoints\n"), "{text}");
+    assert!(text.contains("[2.1] Checkpoint 2.1"), "{text}");
+    assert!(text.contains("[3] Working tree"), "{text}");
+    assert!(text.contains("[3.1] Checkpoint 3.1"), "{text}");
     assert!(
-        diff2.contains("-// session one\n+// session two\n"),
-        "{diff2}"
+        text.contains("2 commits, 2 checkpoints (1 uncommitted)"),
+        "{text}"
     );
-    let diff1 = trail_ok(&f.root, &["review", "1", "src/lib.rs"]);
-    assert!(diff1.contains("+// session one\n"), "{diff1}");
-    assert!(!diff1.contains("session two"), "{diff1}");
-    let created = trail_ok(&f.root, &["review", "1", "src/one.rs"]);
+
+    // A commit section: development path plus the final diff.
+    let two = trail_ok(&f.root, &["review", "2"]);
+    assert!(two.contains("Commit\n[2] "), "{two}");
+    assert!(two.contains("Development path\n    [2.1]"), "{two}");
+    assert!(
+        two.contains("Final commit diff\n    2 files  +2\n"),
+        "{two}"
+    );
+    assert!(two.contains("+ src/one.rs  +1"), "{two}");
+    let by_prefix = trail_json(
+        &f.root,
+        &["review", &sections[1]["id"].as_str().unwrap()[..7]],
+    );
+    assert_eq!(by_prefix["number"], 2);
+    // The working tree section.
+    let three = trail_ok(&f.root, &["review", "3"]);
+    assert!(three.contains("Uncommitted changes"), "{three}");
+    assert!(three.contains("+ src/two.rs  +1  untracked"), "{three}");
+    // A checkpoint, by label and by id.
+    let cp = trail_ok(&f.root, &["review", "2.1"]);
+    assert!(cp.contains("[2.1] Checkpoint 2.1"), "{cp}");
+    assert!(cp.contains("+ src/one.rs  +1"), "{cp}");
+    let by_id = trail_json(&f.root, &["review", cps2[0]["id"].as_str().unwrap()]);
+    assert_eq!(by_id["label"], "2.1");
+
+    // Checkpoint diff: what checkpoint 3.1 changed in src/lib.rs is the step
+    // from "session one" to "session two"...
+    let cp_diff = trail_ok(&f.root, &["review", "3.1", "src/lib.rs"]);
+    assert!(
+        cp_diff.contains("-// session one\n+// session two\n"),
+        "{cp_diff}"
+    );
+    // ... while the commit diff of commit 2 is parent -> commit.
+    let commit_diff = trail_ok(&f.root, &["review", "2", "src/lib.rs"]);
+    assert!(commit_diff.contains("+// session one\n"), "{commit_diff}");
+    assert!(!commit_diff.contains("session two"), "{commit_diff}");
+    let created = trail_ok(&f.root, &["review", "2", "src/one.rs"]);
     assert!(
         created.contains("--- /dev/null\n+++ b/src/one.rs\n"),
         "{created}"
     );
-    assert!(created.contains("+one\n"));
+    // And the working tree diff of a file is HEAD -> disk.
+    let wt_diff = trail_ok(&f.root, &["review", "3", "src/lib.rs"]);
+    assert!(
+        wt_diff.contains("-// session one\n+// session two\n"),
+        "{wt_diff}"
+    );
+    let untracked = trail_ok(&f.root, &["review", "3", "src/two.rs"]);
+    assert!(untracked.contains("+two\n"), "{untracked}");
     // Relative path from a subdirectory and JSON shape.
-    let from_src = trail_json(&f.root.join("src"), &["review", "2", "lib.rs"]);
+    let from_src = trail_json(&f.root.join("src"), &["review", "3.1", "lib.rs"]);
     assert_eq!(from_src["file"]["path"], "src/lib.rs");
     assert!(from_src["diff"]
         .as_str()
@@ -1495,21 +1545,57 @@ fn review_lists_checkpoints_and_shows_per_checkpoint_diffs() {
     let out = trail(&f.root, &["review", "9"]);
     assert!(!out.ok);
     assert!(
-        out.stderr.contains("checkpoint 9 does not exist"),
+        out.stderr.contains("section 9 does not exist"),
         "{}",
         out.stderr
     );
-    let out = trail(&f.root, &["review", "1", "src/two.rs"]);
+    let out = trail(&f.root, &["review", "2", "src/two.rs"]);
     assert!(!out.ok);
     assert!(
-        out.stderr.contains("is not part of checkpoint 1"),
+        out.stderr.contains("is not part of commit 2"),
+        "{}",
+        out.stderr
+    );
+    let out = trail(&f.root, &["review", "2.1", "src/two.rs"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("is not part of checkpoint 2.1"),
         "{}",
         out.stderr
     );
     let out = trail(&f.root, &["review", "nope.9"]);
     assert!(!out.ok);
     assert!(
-        out.stderr.contains("no checkpoint nope.9"),
+        out.stderr.contains("no checkpoint or commit nope.9"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn review_commit_shows_development_path_and_final_diff() {
+    let f = Fixture::with_feature("main");
+    record_session_with_commit(&f.root);
+    let json = trail_json(&f.root, &["review", "--commit", "HEAD"]);
+    assert_eq!(json["summary"], "recorded commit");
+    assert_eq!(json["number"], 2);
+    assert_eq!(json["checkpoints"][0]["label"], "2.1");
+    assert_eq!(json["files"].as_array().unwrap().len(), 2);
+    let text = trail_ok(&f.root, &["review", "--commit", "HEAD"]);
+    assert!(text.starts_with("\nCommit\n[2] "), "{text}");
+    assert!(text.contains("Development path\n    [2.1]"), "{text}");
+    assert!(text.contains("Final commit diff"), "{text}");
+    let diff = trail_ok(&f.root, &["review", "--commit", "HEAD", "src/one.rs"]);
+    assert!(diff.contains("+one\n"), "{diff}");
+    // A commit outside the review window is still a fact worth showing,
+    // without checkpoints.
+    let base = trail_json(&f.root, &["review", "--commit", "main"]);
+    assert_eq!(base["summary"], "add b");
+    assert_eq!(base["checkpoints"].as_array().unwrap().len(), 0);
+    let out = trail(&f.root, &["review", "--commit", "nope"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("not a known revision"),
         "{}",
         out.stderr
     );
@@ -1523,7 +1609,7 @@ fn review_open_launches_the_editor_on_the_after_snapshot() {
     let log = f.root.join("opened.log");
     let script = fake_editor(&f.root, &format!("cat \"$1\" >> {}", log.display()));
     let out = Command::new(env!("CARGO_BIN_EXE_trail"))
-        .args(["review", "1", "src/lib.rs", "--open"])
+        .args(["review", "2.1", "src/lib.rs", "--open"])
         .current_dir(&f.root)
         .env("EDITOR", &script)
         .output()
@@ -1537,6 +1623,20 @@ fn review_open_launches_the_editor_on_the_after_snapshot() {
         std::fs::read_to_string(&log).unwrap(),
         "fn a() {}\nfn b() {}\n// session one\n"
     );
+    // A commit selection opens the file as committed (the commit tree blob).
+    std::fs::remove_file(&log).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .args(["review", "2", "src/one.rs", "--open"])
+        .current_dir(&f.root)
+        .env("EDITOR", &script)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\n");
 }
 
 #[test]
@@ -1546,8 +1646,10 @@ fn review_marks_missing_snapshots_and_respects_since_and_hidden() {
     let json = trail_json(&f.root, &["review"]);
     assert_eq!(json["checkpoints"][0]["files"][0]["snapshot"], false);
     assert!(json["checkpoints"][0]["files"][0]["additions"].is_null());
-    assert!(trail_ok(&f.root, &["review"]).contains("snapshot unavailable"));
-    let out = trail_ok(&f.root, &["review", "1", "src/lib.rs"]);
+    // Nothing was committed after these checkpoints: they are working tree.
+    assert_eq!(json["checkpoints"][0]["label"], "2.1");
+    assert!(trail_ok(&f.root, &["review", "2.1"]).contains("snapshot unavailable"));
+    let out = trail_ok(&f.root, &["review", "2.1", "src/lib.rs"]);
     assert!(out.contains("snapshot unavailable for this change"));
 
     // Hidden checkpoints leave the review and the numbering closes the gap.
@@ -1560,9 +1662,9 @@ fn review_marks_missing_snapshots_and_respects_since_and_hidden() {
     trail_ok(&f.root, &["edit", "--from", edited.to_str().unwrap()]);
     let json = trail_json(&f.root, &["review"]);
     assert_eq!(json["checkpoints"].as_array().unwrap().len(), 1);
-    assert_eq!(json["checkpoints"][0]["number"], 1);
+    assert_eq!(json["checkpoints"][0]["label"], "2.1");
     assert_eq!(json["checkpoints"][0]["id"], "synth.2");
-    assert!(trail_ok(&f.root, &["review"]).contains("[1] Tests"));
+    assert!(trail_ok(&f.root, &["review"]).contains("[2.1] Tests"));
 
     // --since HEAD: no checkpoints started before HEAD's commit time... they
     // did start after it (synthetic timestamps are now), so they stay; the
@@ -1579,4 +1681,597 @@ fn interactive_review_refuses_to_run_without_a_terminal() {
     assert!(out.stderr.contains("needs a terminal"), "{}", out.stderr);
     // The text command is unaffected and still pipes.
     assert!(trail_ok(&f.root, &["review"]).contains("Review"));
+}
+
+// ---------------------------------------------------------------------------
+// Worktree and commit-centric review
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git must be installed");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn rev(dir: &Path, rev: &str) -> String {
+    git_out(dir, &["rev-parse", rev])
+}
+
+/// Commit with explicit author and committer dates (RFC 3339).
+fn commit_at(dir: &Path, message: &str, date: &str) {
+    let status = Command::new("git")
+        .args(["commit", "-qm", message])
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// A synthetic session log. `records` are JSON lines without the header
+/// and end record; `at` is the session start.
+fn write_session(
+    root: &Path,
+    worktree_id: &str,
+    branch: &str,
+    session_id: &str,
+    start_head: Option<&str>,
+    at: chrono::DateTime<chrono::Utc>,
+    records: &[String],
+) {
+    let dir = root
+        .join(".git/trail/worktrees")
+        .join(worktree_id)
+        .join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = format!(
+        "{{\"kind\":\"session\",\"version\":1,\"session_id\":\"{session_id}\",\"repository_root\":\"{r}\",\"worktree_id\":\"{worktree_id}\",\"worktree_path\":\"{r}\",\"branch\":\"{branch}\",\"base_commit\":null,\"start_head\":{sh},\"started_at\":\"{s}\"}}\n",
+        r = root.display(),
+        sh = start_head
+            .map(|h| format!("\"{h}\""))
+            .unwrap_or_else(|| "null".into()),
+        s = at.to_rfc3339()
+    );
+    let mut text = header;
+    for r in records {
+        text.push_str(r);
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "{{\"kind\":\"end\",\"ended_at\":\"{}\",\"events\":0}}\n",
+        (at + chrono::Duration::hours(1)).to_rfc3339()
+    ));
+    std::fs::write(dir.join(format!("session-{session_id}.jsonl")), text).unwrap();
+}
+
+fn ev_line(at: chrono::DateTime<chrono::Utc>, path: &str) -> String {
+    format!(
+        "{{\"kind\":\"event\",\"timestamp\":\"{}\",\"path\":\"{path}\",\"type\":\"modified\",\"before_hash\":\"a\",\"after_hash\":\"b\"}}",
+        at.to_rfc3339()
+    )
+}
+
+fn commit_line(at: chrono::DateTime<chrono::Utc>, from: &str, to: &str) -> String {
+    format!(
+        "{{\"kind\":\"commit\",\"timestamp\":\"{}\",\"from_head\":\"{from}\",\"to_head\":\"{to}\"}}",
+        at.to_rfc3339()
+    )
+}
+
+/// Labels of the checkpoints under each section, with their attachment.
+fn grouping(json: &serde_json::Value) -> Vec<(String, Vec<(String, String)>)> {
+    json["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            let title = match s["kind"].as_str().unwrap() {
+                "commit" => s["summary"].as_str().unwrap().to_string(),
+                _ => "working tree".to_string(),
+            };
+            let cps = s["checkpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    (
+                        c["label"].as_str().unwrap().to_string(),
+                        c["attachment"].as_str().unwrap_or("none").to_string(),
+                    )
+                })
+                .collect();
+            (title, cps)
+        })
+        .collect()
+}
+
+#[test]
+fn checkpoints_are_grouped_under_the_commit_that_followed_them() {
+    let f = Fixture::with_feature("main");
+    let a = rev(&f.root, "HEAD"); // add feature module: made before the recorder
+    write(&f.root, "b.txt", "b\n");
+    git(&f.root, &["add", "-A"]);
+    git(&f.root, &["commit", "-qm", "commit B"]);
+    let b = rev(&f.root, "HEAD");
+    write(&f.root, "c.txt", "c\n");
+    git(&f.root, &["add", "-A"]);
+    git(&f.root, &["commit", "-qm", "commit C"]);
+    let c = rev(&f.root, "HEAD");
+
+    // The recorder saw: cp1, cp2, A->B, cp3, cp4, B->C, cp5 (never committed).
+    let now = chrono::Utc::now();
+    let t = |m: i64| now + chrono::Duration::minutes(m);
+    write_session(
+        &f.root,
+        "main",
+        "feature",
+        "grp",
+        Some(&a),
+        now,
+        &[
+            ev_line(t(1), "one.rs"),
+            ev_line(t(2), "two.rs"),
+            commit_line(t(3), &a, &b),
+            ev_line(t(4), "three.rs"),
+            ev_line(t(5), "four.rs"),
+            commit_line(t(6), &b, &c),
+            ev_line(t(7), "five.rs"),
+        ],
+    );
+    let json = trail_json(&f.root, &["review"]);
+    assert_eq!(
+        grouping(&json),
+        vec![
+            ("add feature module".to_string(), vec![]),
+            (
+                "commit B".to_string(),
+                vec![
+                    ("2.1".to_string(), "recorded".to_string()),
+                    ("2.2".to_string(), "recorded".to_string())
+                ]
+            ),
+            (
+                "commit C".to_string(),
+                vec![
+                    ("3.1".to_string(), "recorded".to_string()),
+                    ("3.2".to_string(), "recorded".to_string())
+                ]
+            ),
+            (
+                "working tree".to_string(),
+                vec![("4.1".to_string(), "none".to_string())]
+            ),
+        ],
+        "{json:#?}"
+    );
+    // The commit boundary is on the trail events too.
+    let history = trail_json(&f.root, &["history"]);
+    let cps: Vec<&serde_json::Value> = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "checkpoint")
+        .collect();
+    assert_eq!(cps[0]["boundary"]["to_head"], b);
+    assert_eq!(cps[0]["commit"], b);
+    assert!(cps[4]["boundary"].is_null());
+    assert!(cps[4]["commit"].is_null());
+    // The root command counts them.
+    let root = trail_ok(&f.root, &[]);
+    assert!(root.contains("Commits\n  3\n"), "{root}");
+    assert!(root.contains("Working tree\n  1 checkpoint\n"), "{root}");
+    assert!(
+        root.contains("Development history\n  5 checkpoints\n"),
+        "{root}"
+    );
+}
+
+#[test]
+fn checkpoints_without_a_recorded_boundary_are_attached_by_time() {
+    // Every commit is dated so that checkpoints can sit between them.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let base = chrono::Utc::now() - chrono::Duration::hours(3);
+    let at = |m: i64| (base + chrono::Duration::minutes(m)).to_rfc3339();
+    git(&root, &["init", "-q", "-b", "main"]);
+    write(&root, "README.md", "hello\n");
+    git(&root, &["add", "-A"]);
+    commit_at(&root, "initial commit", &at(0));
+    git(&root, &["checkout", "-qb", "feature"]);
+    write(&root, "a.txt", "a\n");
+    git(&root, &["add", "-A"]);
+    commit_at(&root, "commit A", &at(10));
+    write(&root, "b.txt", "b\n");
+    git(&root, &["add", "-A"]);
+    commit_at(&root, "commit B", &at(60));
+    write(&root, "c.txt", "c\n");
+    git(&root, &["add", "-A"]);
+    commit_at(&root, "commit C", &at(120));
+
+    // Sessions that recorded no HEAD movement at all (the recorder was
+    // stopped before each commit): +30 -> B, +90 -> C, +150 -> working tree.
+    let t = |m: i64| base + chrono::Duration::minutes(m);
+    for (id, minute, path) in [
+        ("s1", 30, "one.rs"),
+        ("s2", 90, "two.rs"),
+        ("s3", 150, "three.rs"),
+    ] {
+        write_session(
+            &root,
+            "main",
+            "feature",
+            id,
+            None,
+            t(minute - 5),
+            &[ev_line(t(minute), path)],
+        );
+    }
+    let json = trail_json(&root, &["review"]);
+    let g = grouping(&json);
+    assert_eq!(g[0], ("commit A".into(), vec![]), "{g:?}");
+    assert_eq!(
+        g[1],
+        ("commit B".into(), vec![("2.1".into(), "inferred".into())])
+    );
+    assert_eq!(
+        g[2],
+        ("commit C".into(), vec![("3.1".into(), "inferred".into())])
+    );
+    assert_eq!(
+        g[3],
+        ("working tree".into(), vec![("4.1".into(), "none".into())])
+    );
+    assert!(trail_ok(&root, &["review"]).contains("[inferred]"));
+}
+
+#[test]
+fn amended_commit_keeps_its_checkpoints() {
+    let f = Fixture::with_feature("main");
+    let a = rev(&f.root, "HEAD");
+    write(&f.root, "b.txt", "b\n");
+    git(&f.root, &["add", "-A"]);
+    git(&f.root, &["commit", "-qm", "commit B"]);
+    let b = rev(&f.root, "HEAD");
+    let now = chrono::Utc::now();
+    let t = |m: i64| now + chrono::Duration::minutes(m);
+    write_session(
+        &f.root,
+        "main",
+        "feature",
+        "amend",
+        Some(&a),
+        now,
+        &[ev_line(t(1), "one.rs"), commit_line(t(2), &a, &b)],
+    );
+    // Rewriting B keeps the author time: the checkpoint follows it.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    git(
+        &f.root,
+        &["commit", "-q", "--amend", "-m", "commit B (amended)"],
+    );
+    assert_ne!(rev(&f.root, "HEAD"), b);
+    let json = trail_json(&f.root, &["review"]);
+    let g = grouping(&json);
+    assert_eq!(
+        g[1],
+        (
+            "commit B (amended)".into(),
+            vec![("2.1".into(), "inferred".into())]
+        ),
+        "{g:?}"
+    );
+    // A reset to an older commit is a HEAD movement but not a commit: the
+    // checkpoint is not attached to the older commit.
+    write_session(
+        &f.root,
+        "main",
+        "feature",
+        "reset",
+        Some(&a),
+        t(10),
+        &[ev_line(t(11), "two.rs"), commit_line(t(12), &b, &a)],
+    );
+    let json = trail_json(&f.root, &["review"]);
+    let g = grouping(&json);
+    assert!(g[0].1.is_empty(), "{g:?}");
+    assert_eq!(g[2].0, "working tree");
+    assert_eq!(g[2].1, vec![("3.1".to_string(), "none".to_string())]);
+}
+
+#[test]
+fn commit_diff_covers_every_change_kind() {
+    let f = Fixture::with_feature("main");
+    write(&f.root, "src/lib.rs", "fn a() {}\nfn b() {}\nfn c() {}\n"); // modified
+    write(&f.root, "added.txt", "new\n"); // added
+    std::fs::remove_file(f.root.join("src/gone.rs")).unwrap(); // deleted
+    git(&f.root, &["mv", "src/old.rs", "src/moved.rs"]); // renamed
+    std::fs::write(f.root.join("img.bin"), [0u8, 1, 2, 255]).unwrap(); // binary
+    write(&f.root, "nonl.txt", "no newline"); // no newline at end
+    git(&f.root, &["add", "-A"]);
+    git(&f.root, &["commit", "-qm", "many kinds"]);
+
+    let json = trail_json(&f.root, &["review", "--commit", "HEAD"]);
+    let files = json["files"].as_array().unwrap();
+    let by = |p: &str| {
+        files
+            .iter()
+            .find(|x| x["path"] == p)
+            .unwrap_or_else(|| panic!("{p}: {json:#?}"))
+    };
+    assert_eq!(by("src/lib.rs")["kind"], "modified");
+    assert_eq!(by("src/lib.rs")["additions"], 1);
+    assert_eq!(by("added.txt")["kind"], "added");
+    assert!(by("added.txt")["before_id"].is_null());
+    assert_eq!(by("src/gone.rs")["kind"], "deleted");
+    assert!(by("src/gone.rs")["after_id"].is_null());
+    assert_eq!(by("src/moved.rs")["kind"], "renamed");
+    assert_eq!(by("src/moved.rs")["old_path"], "src/old.rs");
+    assert_eq!(by("img.bin")["binary"], true);
+    assert!(by("img.bin")["additions"].is_null());
+    assert_eq!(json["stats"]["additions"], 3);
+    assert_eq!(json["stats"]["deletions"], 1);
+
+    let d = |p: &str| trail_ok(&f.root, &["review", "--commit", "HEAD", p]);
+    assert!(d("src/lib.rs").contains("+fn c() {}\n"));
+    assert!(d("added.txt").contains("--- /dev/null\n+++ b/added.txt\n"));
+    assert!(d("src/gone.rs").contains("+++ /dev/null\n"));
+    assert!(d("src/moved.rs").contains("--- a/src/old.rs\n+++ b/src/moved.rs\n"));
+    assert!(d("img.bin").contains("Binary files differ"));
+    assert!(d("nonl.txt").contains("\\ No newline at end of file"));
+
+    // A merge commit is diffed against its first parent, and says so.
+    git(&f.root, &["checkout", "-q", "main"]);
+    write(&f.root, "on-main.txt", "m\n");
+    git(&f.root, &["add", "-A"]);
+    git(&f.root, &["commit", "-qm", "on main"]);
+    git(&f.root, &["checkout", "-q", "feature"]);
+    git(
+        &f.root,
+        &["merge", "-q", "--no-ff", "-m", "merge main", "main"],
+    );
+    let merge = trail_json(&f.root, &["review", "--commit", "HEAD"]);
+    assert_eq!(merge["is_merge"], true);
+    assert_eq!(merge["diff_parent"], rev(&f.root, "HEAD^1"));
+    let merged: Vec<&str> = merge["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        merged,
+        vec!["on-main.txt"],
+        "only what the merge brought in"
+    );
+    assert!(
+        trail_ok(&f.root, &["review", "--commit", "HEAD"]).contains("merge (diff vs first parent)")
+    );
+    // An empty commit has an empty diff and still shows up.
+    git(&f.root, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+    let empty = trail_json(&f.root, &["review", "--commit", "HEAD"]);
+    assert_eq!(empty["files"].as_array().unwrap().len(), 0);
+    assert!(trail_ok(&f.root, &["review"]).contains(" empty\n"));
+}
+
+fn add_worktree(f: &Fixture, dir: &Path, name: &str, branch: &str) -> PathBuf {
+    let wt = dir.join(name);
+    git(
+        &f.root,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", branch],
+    );
+    wt.canonicalize().unwrap()
+}
+
+#[test]
+fn worktrees_lists_present_and_removed_worktrees() {
+    let f = Fixture::with_feature("main");
+    let dir = TempDir::new().unwrap();
+    let wt1 = add_worktree(&f, dir.path(), "wt-one", "agent/one");
+    let wt2 = add_worktree(&f, dir.path(), "wt-two", "agent/two");
+    write(&wt1, "one.txt", "1\n");
+    git(&wt1, &["add", "-A"]);
+    git(&wt1, &["commit", "-qm", "one"]);
+    record_session_with_commit(&wt2);
+
+    let json = trail_json(&f.root, &["worktrees"]);
+    let wts = json["worktrees"].as_array().unwrap();
+    let by = |id: &str| {
+        wts.iter()
+            .find(|w| w["id"] == id)
+            .unwrap_or_else(|| panic!("{id}: {json:#?}"))
+    };
+    assert_eq!(by("main")["current"], true);
+    assert_eq!(by("main")["branch"], "feature");
+    assert_eq!(by("main")["kind"], "main");
+    assert_eq!(by("main")["commits"], 1);
+    assert_eq!(by("wt-one")["branch"], "agent/one");
+    assert_eq!(by("wt-one")["commits"], 2);
+    assert_eq!(by("wt-one")["checkpoints"], 0);
+    assert_eq!(by("wt-two")["exists"], true);
+    assert_eq!(by("wt-two")["checkpoints"], 2);
+    assert_eq!(by("wt-two")["commits"], 2);
+    assert_eq!(by("wt-two")["path"], wt2.to_str().unwrap());
+    // The listing is worktree-centric from a linked worktree as well.
+    let from_linked = trail_json(&wt1, &["worktrees"]);
+    let cur: Vec<&str> = from_linked["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["current"] == true)
+        .map(|w| w["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(cur, vec!["wt-one"]);
+
+    // Removed: still listed from its recorded history.
+    git(
+        &f.root,
+        &["worktree", "remove", "--force", wt2.to_str().unwrap()],
+    );
+    let json = trail_json(&f.root, &["worktrees"]);
+    let wts = json["worktrees"].as_array().unwrap();
+    let two = wts.iter().find(|w| w["id"] == "wt-two").unwrap();
+    assert_eq!(two["exists"], false);
+    assert_eq!(two["branch"], "agent/two");
+    assert_eq!(two["checkpoints"], 2);
+    assert_eq!(
+        two["commits"], 2,
+        "reconstructed from the branch ref: {two:#?}"
+    );
+    let text = trail_ok(&f.root, &["worktrees"]);
+    assert!(text.contains("main  (current)"), "{text}");
+    assert!(text.contains("wt-two  (removed)"), "{text}");
+    assert!(text.contains("branch: agent/two"), "{text}");
+}
+
+#[test]
+fn review_worktree_selects_by_id_or_branch_and_refuses_ambiguity() {
+    let f = Fixture::with_feature("main");
+    let dir = TempDir::new().unwrap();
+    let wt = add_worktree(&f, dir.path(), "agent-wt", "agent");
+    record_session_with_commit(&wt);
+
+    // By id and by branch, from the main worktree: the linked worktree's
+    // commits, checkpoints and working tree.
+    for sel in ["agent-wt", "agent"] {
+        let json = trail_json(&f.root, &["review", "--worktree", sel]);
+        assert_eq!(json["worktree"]["id"], "agent-wt", "{sel}");
+        assert_eq!(json["worktree"]["current"], false);
+        assert_eq!(json["worktree"]["exists"], true);
+        let g = grouping(&json);
+        assert_eq!(g[1].0, "recorded commit");
+        assert_eq!(g[1].1.len(), 1);
+        assert_eq!(g[2].0, "working tree");
+        assert_eq!(g[2].1.len(), 1);
+        assert_eq!(json["sections"][2]["unstaged"], 1);
+    }
+    let text = trail_ok(&f.root, &["review", "--worktree", "agent"]);
+    assert!(text.contains("worktree agent-wt"), "{text}");
+    // The current worktree by its own id or branch is just the default.
+    let me = trail_json(&f.root, &["review", "--worktree", "feature"]);
+    assert_eq!(me["worktree"]["current"], true);
+    let out = trail(&f.root, &["review", "--worktree", "nope"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("no worktree with id or branch 'nope'"),
+        "{}",
+        out.stderr
+    );
+
+    // Removed: reconstructed from git objects, snapshots and the log.
+    git(
+        &f.root,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    let json = trail_json(&f.root, &["review", "--worktree", "agent-wt"]);
+    assert_eq!(json["worktree"]["exists"], false);
+    let g = grouping(&json);
+    assert_eq!(g[1].0, "recorded commit");
+    assert_eq!(g[1].1, vec![("2.1".to_string(), "recorded".to_string())]);
+    assert_eq!(g[2].1, vec![("3.1".to_string(), "none".to_string())]);
+    assert_eq!(json["sections"][2]["available"], false);
+    assert_eq!(json["sections"][2]["files"].as_array().unwrap().len(), 0);
+    let text = trail_ok(&f.root, &["review", "--worktree", "agent-wt"]);
+    assert!(text.contains("(worktree removed)"), "{text}");
+    assert!(
+        text.contains("worktree removed: no working tree state"),
+        "{text}"
+    );
+    // Snapshots still serve checkpoint diffs and the commit diff is git's.
+    let cp = trail_ok(
+        &f.root,
+        &["review", "--worktree", "agent-wt", "3.1", "src/lib.rs"],
+    );
+    assert!(cp.contains("-// session one\n+// session two\n"), "{cp}");
+    let commit = trail_ok(
+        &f.root,
+        &["review", "--worktree", "agent-wt", "2", "src/one.rs"],
+    );
+    assert!(commit.contains("+one\n"), "{commit}");
+    let wt_file = trail(
+        &f.root,
+        &["review", "--worktree", "agent-wt", "3", "src/lib.rs"],
+    );
+    assert!(!wt_file.ok);
+    assert!(
+        wt_file.stderr.contains("worktree was removed"),
+        "{}",
+        wt_file.stderr
+    );
+    assert!(trail(&f.root, &["review", "--worktree", "agent-wt", "-i"])
+        .stderr
+        .contains("needs a terminal"));
+
+    // The branch name is reused by a new worktree: the branch selector is
+    // ambiguous, the id still works.
+    let wt2 = add_worktree(&f, dir.path(), "agent-wt-2", "agent-2");
+    git(&wt2, &["checkout", "-q", "-B", "agent"]);
+    let out = trail(&f.root, &["review", "--worktree", "agent"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("matches several worktrees"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("agent-wt") && out.stderr.contains("agent-wt-2"));
+    assert_eq!(
+        trail_json(&f.root, &["review", "--worktree", "agent-wt-2"])["worktree"]["id"],
+        "agent-wt-2"
+    );
+    assert_eq!(
+        trail_json(&f.root, &["review", "--worktree", "agent-wt"])["worktree"]["exists"],
+        false
+    );
+}
+
+#[test]
+fn review_since_push_works_for_the_current_and_another_worktree() {
+    let f = Fixture::with_feature("main");
+    let _remote = push_to_bare_remote(&f);
+    write_synthetic_session(&f.root);
+    write(
+        &f.root,
+        "src/lib.rs",
+        "fn a() {}\nfn b() {}\n// after push\n",
+    );
+    git(&f.root, &["commit", "-qam", "after push"]);
+    let json = trail_json(&f.root, &["review", "--since", "push"]);
+    assert_eq!(json["repository"]["since"]["kind"], "last_push");
+    let g = grouping(&json);
+    assert_eq!(g.len(), 2, "{g:?}");
+    assert_eq!(g[0].0, "after push");
+    let text = trail_ok(&f.root, &["review", "--since", "push"]);
+    assert!(text.contains("since last push to origin/feature"), "{text}");
+
+    // Another worktree with its own pushed branch.
+    let dir = TempDir::new().unwrap();
+    let wt = add_worktree(&f, dir.path(), "pushed-wt", "pushed");
+    write(&wt, "p.txt", "p\n");
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "before push"]);
+    git(&wt, &["push", "-q", "-u", "origin", "pushed"]);
+    write(&wt, "q.txt", "q\n");
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "not pushed"]);
+    let json = trail_json(
+        &f.root,
+        &["review", "--worktree", "pushed-wt", "--since", "push"],
+    );
+    assert_eq!(json["repository"]["since"]["kind"], "last_push");
+    let g = grouping(&json);
+    assert_eq!(g.len(), 2, "{g:?}");
+    assert_eq!(g[0].0, "not pushed");
+    let all = trail_json(&f.root, &["review", "--worktree", "pushed-wt"]);
+    assert_eq!(
+        grouping(&all).len(),
+        5,
+        "add feature module, after push, before push, not pushed, working tree"
+    );
 }

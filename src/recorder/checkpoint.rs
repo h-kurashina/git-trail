@@ -70,6 +70,16 @@ pub struct FileChange {
     pub edits: u32,
 }
 
+/// The HEAD movement the recorder observed right after a checkpoint. Only a
+/// movement whose `to_head` has `from_head` as first parent is a commit; a
+/// checkout, reset or rebase looks the same here and is told apart later,
+/// with the repository at hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitBoundary {
+    pub from_head: String,
+    pub to_head: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Checkpoint {
     pub id: String,
@@ -78,6 +88,10 @@ pub struct Checkpoint {
     pub ended_at: DateTime<Utc>,
     pub changes: Vec<FileChange>,
     pub bulk: bool,
+    /// The HEAD movement that closed this checkpoint's run of work, when the
+    /// recorder saw one before the session ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<CommitBoundary>,
     pub source: EventSource,
     pub confidence: Confidence,
     /// Human supplied, via the metadata overlay (`trail edit`).
@@ -95,6 +109,7 @@ impl Checkpoint {
             ended_at: first.last_seen,
             changes: Vec::new(),
             bulk: false,
+            boundary: None,
             source: EventSource::TrailRecorder,
             confidence: Confidence::Exact,
             title: None,
@@ -201,6 +216,18 @@ impl<'a> Grouper<'a> {
         }
     }
 
+    /// HEAD moved: every checkpoint since the previous movement was work
+    /// towards `to_head`.
+    fn head_moved(&mut self, from_head: &str, to_head: &str) {
+        self.close();
+        for cp in self.done.iter_mut().filter(|cp| cp.boundary.is_none()) {
+            cp.boundary = Some(CommitBoundary {
+                from_head: from_head.to_string(),
+                to_head: to_head.to_string(),
+            });
+        }
+    }
+
     fn push(&mut self, change: FileChange) {
         let starts_new = match &self.open {
             Some(cp) => change.first_seen - cp.ended_at > WINDOW,
@@ -235,7 +262,13 @@ pub fn build_checkpoints(session_id: &str, records: &[Record]) -> Vec<Checkpoint
     for record in records {
         match record {
             Record::Event(event) => run.push(event),
-            Record::Commit { .. } | Record::End(_) => {
+            Record::Commit {
+                from_head, to_head, ..
+            } => {
+                grouper.push_run(&mut run);
+                grouper.head_moved(from_head, to_head);
+            }
+            Record::End(_) => {
                 grouper.push_run(&mut run);
                 grouper.close();
             }
@@ -373,6 +406,53 @@ mod tests {
         assert_eq!(cps.len(), 2);
         assert!(cps[0].ended_at < t(1, 0));
         assert!(cps[1].started_at > t(1, 0));
+        assert_eq!(
+            cps[0].boundary,
+            Some(CommitBoundary {
+                from_head: "aaa".into(),
+                to_head: "bbb".into()
+            })
+        );
+        assert_eq!(cps[1].boundary, None, "nothing was committed after it");
+    }
+
+    #[test]
+    fn every_checkpoint_before_a_commit_gets_its_boundary() {
+        let records = vec![
+            ev(0, 0, "a.rs", RawEventKind::Modified, Some("h0"), Some("h1")),
+            ev(
+                40,
+                0,
+                "a.rs",
+                RawEventKind::Modified,
+                Some("h1"),
+                Some("h2"),
+            ),
+            Record::Commit {
+                timestamp: t(41, 0),
+                from_head: "aaa".into(),
+                to_head: "bbb".into(),
+            },
+            ev(
+                42,
+                0,
+                "a.rs",
+                RawEventKind::Modified,
+                Some("h2"),
+                Some("h3"),
+            ),
+            Record::Commit {
+                timestamp: t(43, 0),
+                from_head: "bbb".into(),
+                to_head: "ccc".into(),
+            },
+        ];
+        let cps = build_checkpoints("s", &records);
+        let to: Vec<Option<&str>> = cps
+            .iter()
+            .map(|c| c.boundary.as_ref().map(|b| b.to_head.as_str()))
+            .collect();
+        assert_eq!(to, vec![Some("bbb"), Some("bbb"), Some("ccc")]);
     }
 
     #[test]
