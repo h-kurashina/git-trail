@@ -10,6 +10,7 @@ use serde::Serialize;
 use super::{Cli, Command};
 use crate::display::terminal;
 use crate::edit;
+use crate::git::baseline::SinceSpec;
 use crate::git::repository::Repo;
 use crate::recorder;
 use crate::trail::builder;
@@ -47,18 +48,28 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 
     let base = repo.resolve_base(cli.base.as_deref())?;
+    // `trail changes` defaults to the last push; everything else to the base branch.
+    let since = match (&cli.command, cli.since.as_deref()) {
+        (Some(Command::Changes), None) => SinceSpec::Auto,
+        (_, value) => SinceSpec::parse(value),
+    };
+    let baseline = repo.resolve_baseline(&since, &base)?;
     match cli.command {
         Some(Command::Start { .. })
         | Some(Command::Sessions)
         | Some(Command::Open { at: None, .. }) => {
             unreachable!("handled above")
         }
+        Some(Command::Changes) => {
+            let report = builder::build_changes(&repo, &base, &baseline)?;
+            emit(cli.json, &report, terminal::render_changes)
+        }
         Some(Command::Open {
             file,
             at: Some(checkpoint),
             print,
         }) => {
-            let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
+            let trail = builder::build_trail(&repo, &base, &baseline, builder::Scope::Overview)?;
             Ok(edit::open_at(
                 &repo,
                 &trail,
@@ -69,11 +80,11 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             )?)
         }
         Some(Command::Edit { from, print }) => {
-            let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
+            let trail = builder::build_trail(&repo, &base, &baseline, builder::Scope::Overview)?;
             Ok(edit::run(&repo, &trail, from.as_deref(), print)?)
         }
         None => {
-            let trail = builder::build_trail(&repo, &base, builder::Scope::Overview)?;
+            let trail = builder::build_trail(&repo, &base, &baseline, builder::Scope::Overview)?;
             emit(cli.json, &trail, terminal::render_trail)
         }
         Some(Command::Status) => {
@@ -81,7 +92,8 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             emit(cli.json, &report, terminal::render_status)
         }
         Some(Command::History { limit }) => {
-            let mut trail = builder::build_trail(&repo, &base, builder::Scope::Detailed)?;
+            let mut trail =
+                builder::build_trail(&repo, &base, &baseline, builder::Scope::Detailed)?;
             if let Some(n) = limit {
                 trail.truncate_to_latest(n);
             }

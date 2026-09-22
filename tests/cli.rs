@@ -1214,3 +1214,214 @@ fn sessions_without_snapshots_are_marked() {
         out.stderr
     );
 }
+
+/// Adds a bare remote and pushes the current branch to it (with -u).
+fn push_to_bare_remote(f: &Fixture) -> TempDir {
+    let remote = TempDir::new().unwrap();
+    git(remote.path(), &["init", "-q", "--bare"]);
+    git(
+        &f.root,
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    git(&f.root, &["push", "-q", "-u", "origin", "HEAD"]);
+    remote
+}
+
+#[test]
+fn changes_falls_back_from_last_push_to_upstream_to_base() {
+    let f = Fixture::with_feature("main");
+
+    // No remote at all: the base branch is the baseline, and says so.
+    let json = trail_json(&f.root, &["changes"]);
+    assert_eq!(json["repository"]["since"]["kind"], "base_branch");
+    assert_eq!(json["commits"].as_array().unwrap().len(), 1);
+    assert!(trail_ok(&f.root, &["changes"]).contains("Changes since base main"));
+
+    // After a push: last push wins, nothing has changed since.
+    let _remote = push_to_bare_remote(&f);
+    let json = trail_json(&f.root, &["changes"]);
+    assert_eq!(json["repository"]["since"]["kind"], "last_push");
+    assert_eq!(
+        json["repository"]["since"]["label"],
+        "last push to origin/feature"
+    );
+    assert_eq!(json["commits"].as_array().unwrap().len(), 0);
+    assert_eq!(json["files"].as_array().unwrap().len(), 0);
+
+    // Commit + staged + unstaged + untracked after the push are all included.
+    write(
+        &f.root,
+        "src/lib.rs",
+        "fn a() {}\nfn b() {}\n// committed after push\n",
+    );
+    git(&f.root, &["commit", "-qam", "after push"]);
+    write(&f.root, "README.md", "hello\nstaged\n");
+    git(&f.root, &["add", "README.md"]);
+    write(
+        &f.root,
+        "src/feature.rs",
+        "pub fn feature() {}\n// unstaged\n",
+    );
+    write(&f.root, "notes.txt", "untracked\n");
+    let json = trail_json(&f.root, &["changes"]);
+    assert_eq!(json["commits"][0]["summary"], "after push");
+    let files = json["files"].as_array().unwrap();
+    let find = |p: &str| {
+        files
+            .iter()
+            .find(|x| x["path"] == p)
+            .unwrap_or_else(|| panic!("{p} missing: {files:?}"))
+    };
+    assert_eq!(find("src/lib.rs")["kind"], "modified");
+    assert!(
+        find("src/lib.rs")["status"].is_null(),
+        "committed change has no worktree status"
+    );
+    assert_eq!(find("README.md")["status"]["staged"], "modified");
+    assert_eq!(find("src/feature.rs")["status"]["unstaged"], "modified");
+    assert_eq!(find("notes.txt")["kind"], "added");
+    assert_eq!(find("notes.txt")["status"]["untracked"], true);
+    assert_eq!(json["counts"]["staged"], 1);
+    assert_eq!(json["counts"]["unstaged"], 1);
+    assert_eq!(json["counts"]["untracked"], 1);
+    assert_eq!(json["stats"]["additions"], 4);
+    let text = trail_ok(&f.root, &["changes"]);
+    assert!(text.contains("Changes since last push to origin/feature"));
+    assert!(text.contains("~ src/lib.rs\n      +1  committed"));
+    assert!(text.contains("+ notes.txt\n      +1  untracked"));
+    assert!(text.contains("1 commit, 0 checkpoints"));
+
+    // Upstream moved without a push (a fetch): upstream and last push differ.
+    let head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&f.root)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    git(
+        &f.root,
+        &[
+            "update-ref",
+            "-m",
+            "fetch: fast-forward",
+            "refs/remotes/origin/feature",
+            head.trim(),
+        ],
+    );
+    let upstream = trail_json(&f.root, &["changes", "--since", "upstream"]);
+    assert_eq!(upstream["repository"]["since"]["kind"], "upstream");
+    assert_eq!(upstream["commits"].as_array().unwrap().len(), 0);
+    let push = trail_json(&f.root, &["changes", "--since", "push"]);
+    assert_eq!(push["repository"]["since"]["kind"], "last_push");
+    assert_eq!(push["commits"].as_array().unwrap().len(), 1);
+
+    // Explicit revision and errors.
+    let rev = trail_json(&f.root, &["changes", "--since", "HEAD~1"]);
+    assert_eq!(rev["repository"]["since"]["kind"], "commit");
+    assert_eq!(rev["commits"].as_array().unwrap().len(), 1);
+    let out = trail(&f.root, &["changes", "--since", "nope"]);
+    assert!(!out.ok);
+    assert!(out.stderr.contains("not a known revision"));
+    let g = Fixture::with_feature("main");
+    let out = trail(&g.root, &["changes", "--since", "push"]);
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("no push of this branch"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn since_is_a_view_filter_for_history_and_edit() {
+    let f = Fixture::with_feature("main");
+    let _remote = push_to_bare_remote(&f);
+    write_synthetic_session(&f.root); // two checkpoints, timestamps = now
+    write(
+        &f.root,
+        "src/lib.rs",
+        "fn a() {}\nfn b() {}\n// after push\n",
+    );
+    git(&f.root, &["commit", "-qam", "after push"]);
+
+    // Default view: everything since the base branch.
+    let all = trail_json(&f.root, &["history"]);
+    assert_eq!(all["repository"]["since"]["kind"], "base_branch");
+    assert_eq!(
+        all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "commit")
+            .count(),
+        2
+    );
+
+    // Since the push: only the later commit; recorded checkpoints are still
+    // there because they happened after the pushed commit.
+    let since = trail_json(&f.root, &["history", "--since", "push"]);
+    assert_eq!(since["repository"]["since"]["kind"], "last_push");
+    let commits: Vec<&str> = since["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "commit")
+        .map(|e| e["summary"].as_str().unwrap())
+        .collect();
+    assert_eq!(commits, vec!["after push"]);
+    assert_eq!(checkpoint_ids(&since).len(), 2);
+    let text = trail_ok(&f.root, &["history", "--since", "push"]);
+    assert!(text.contains("Since\n  last push to origin/feature"));
+    assert!(
+        !trail_ok(&f.root, &["history"]).contains("Since\n"),
+        "default view does not show a Since line"
+    );
+
+    // The overview honours --since too, and edit renders the same window.
+    assert!(trail_ok(&f.root, &["--since", "push"]).contains("Since\n  last push"));
+    let doc = trail_ok(&f.root, &["edit", "--print", "--since", "push"]);
+    assert!(doc.contains("# commit ") && doc.contains("after push"));
+    assert!(!doc.contains("add feature module"));
+    assert!(doc.contains("[checkpoint:synth.1]"));
+
+    // Raw log and metadata are untouched by any of this.
+    assert_eq!(
+        std::fs::read_to_string(
+            f.root
+                .join(".git/trail/worktrees/main/sessions/session-synth.jsonl")
+        )
+        .unwrap()
+        .lines()
+        .count(),
+        6
+    );
+    assert!(!f.root.join(".git/trail/metadata/checkpoints.json").exists());
+}
+
+#[test]
+fn baseline_after_amend_uses_the_common_ancestor() {
+    let f = Fixture::with_feature("main");
+    let _remote = push_to_bare_remote(&f);
+    git(
+        &f.root,
+        &[
+            "commit",
+            "-q",
+            "--amend",
+            "-m",
+            "add feature module (amended)",
+        ],
+    );
+    let json = trail_json(&f.root, &["changes"]);
+    let since = &json["repository"]["since"];
+    assert_eq!(since["kind"], "last_push");
+    assert_ne!(since["commit"], since["start"]);
+    assert_eq!(
+        json["commits"][0]["summary"],
+        "add feature module (amended)"
+    );
+    assert!(trail_ok(&f.root, &["changes"]).contains("common ancestor"));
+}

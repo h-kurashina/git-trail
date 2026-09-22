@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::error::Result;
+use crate::git::baseline::{Baseline, SinceSpec};
 use crate::git::diff::{self, ChangeKind, DiffTarget, FileStat, LineStats, StatusEntry};
 use crate::git::history;
 use crate::git::repository::{BaseRef, Repo};
@@ -14,8 +15,9 @@ use crate::recorder::metadata::Metadata;
 use crate::recorder::store::{self, SessionFile};
 use crate::trail::event::{Confidence, EventSource, TrailEvent, TrailEventType};
 use crate::trail::{
-    kind_counts, DiffGroup, DiffReport, InspectCommit, InspectReport, RepositoryContext,
-    SessionSummary, SessionsReport, StatusReport, Trail, TrailSummary,
+    kind_counts, ChangedFile, ChangedFileKind, ChangesReport, DiffGroup, DiffReport, InspectCommit,
+    InspectReport, RepositoryContext, SessionSummary, SessionsReport, StatusReport, Trail,
+    TrailSummary,
 };
 
 /// How much history to reconstruct.
@@ -27,12 +29,13 @@ pub enum Scope {
     Detailed,
 }
 
-fn context(repo: &Repo, base: &BaseRef) -> RepositoryContext {
+fn context(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> RepositoryContext {
     RepositoryContext {
         name: repo.name.clone(),
         head: repo.head.clone(),
         base: base.name.clone(),
         merge_base: repo.short_id(&base.merge_base),
+        since: baseline.clone(),
         worktree: repo.worktree.clone(),
         shallow: repo.is_shallow,
     }
@@ -68,9 +71,14 @@ fn mtime(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(modified))
 }
 
-pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
+pub fn build_trail(
+    repo: &Repo,
+    base: &BaseRef,
+    baseline: &Baseline,
+    scope: Scope,
+) -> Result<Trail> {
     let entries = diff::status(repo.workdir())?;
-    let commits = history::commits_between(repo.gix(), repo.head_id, base.merge_base)?;
+    let commits = history::commits_between(repo.gix(), repo.head_id, baseline.start)?;
     let head_stats = stats_since_head(repo, &entries)?;
     let base_stats = stats_since_base(repo, base, &entries)?;
 
@@ -171,7 +179,7 @@ pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
     // 4. Recorded sessions: exact observations from `trail start`. Where a
     //    checkpoint covers a file, the mtime-based guess for that file is
     //    dropped so nothing is shown twice.
-    let since = merge_base_time(repo, base);
+    let since = commit_time(repo, baseline.start);
     let (checkpoints, metadata) = recorded_checkpoints(repo, since)?;
     let mut covered: HashMap<&Path, DateTime<Utc>> = HashMap::new();
     for (cp, covered_until) in &checkpoints {
@@ -233,14 +241,14 @@ pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
     };
 
     Ok(Trail {
-        repository: context(repo, base),
+        repository: context(repo, base, baseline),
         events,
         summary,
     })
 }
 
-fn merge_base_time(repo: &Repo, base: &BaseRef) -> Option<DateTime<Utc>> {
-    let commit = repo.gix().find_commit(base.merge_base).ok()?;
+fn commit_time(repo: &Repo, id: gix::ObjectId) -> Option<DateTime<Utc>> {
+    let commit = repo.gix().find_commit(id).ok()?;
     let time = commit.time().ok()?;
     chrono::TimeZone::timestamp_opt(&Utc, time.seconds, 0).single()
 }
@@ -377,12 +385,63 @@ pub fn build_sessions(repo: &Repo) -> Result<SessionsReport> {
     })
 }
 
+/// `trail changes`: commits, files and recorded checkpoints since the baseline.
+/// Working tree changes (staged, unstaged, untracked) are always included.
+pub fn build_changes(repo: &Repo, base: &BaseRef, baseline: &Baseline) -> Result<ChangesReport> {
+    let entries = diff::status(repo.workdir())?;
+    let commits = history::commits_between(repo.gix(), repo.head_id, baseline.start)?;
+    let start = baseline.start.to_string();
+    let mut stats = diff::numstat(repo.workdir(), DiffTarget::Revision(&start), &[])?;
+    stats.extend(diff::untracked_stats(repo.workdir(), &entries));
+    let baseline_tree = repo
+        .gix()
+        .find_commit(baseline.start)
+        .ok()
+        .and_then(|c| c.tree().ok());
+    let in_baseline = |path: &Path| -> bool {
+        baseline_tree
+            .as_ref()
+            .and_then(|t| t.lookup_entry_by_path(path).ok().flatten())
+            .is_some()
+    };
+    let files: Vec<ChangedFile> = stats
+        .into_iter()
+        .map(|stat| {
+            let exists_now = repo.workdir().join(&stat.path).exists();
+            let kind = if stat.old_path.is_some() {
+                ChangedFileKind::Renamed
+            } else if !exists_now {
+                ChangedFileKind::Deleted
+            } else if in_baseline(&stat.path) {
+                ChangedFileKind::Modified
+            } else {
+                ChangedFileKind::Added
+            };
+            ChangedFile {
+                status: entries.iter().find(|e| e.path == stat.path).cloned(),
+                kind,
+                stat,
+            }
+        })
+        .collect();
+    let since = commit_time(repo, baseline.start);
+    let (checkpoints, _) = recorded_checkpoints(repo, since)?;
+    Ok(ChangesReport {
+        repository: context(repo, base, baseline),
+        commits,
+        checkpoints: checkpoints.iter().filter(|(cp, _)| !cp.hidden).count(),
+        counts: kind_counts(&entries),
+        stats: total(&files.iter().map(|f| f.stat.clone()).collect::<Vec<_>>()),
+        files,
+    })
+}
+
 pub fn build_status(repo: &Repo, base: &BaseRef) -> Result<StatusReport> {
     let entries = diff::status(repo.workdir())?;
     let stats = total(&stats_since_head(repo, &entries)?);
     let commits_ahead = history::commits_between(repo.gix(), repo.head_id, base.merge_base)?.len();
     Ok(StatusReport {
-        repository: context(repo, base),
+        repository: context(repo, base, &repo.resolve_baseline(&SinceSpec::Base, base)?),
         counts: kind_counts(&entries),
         stats,
         commits_ahead,
@@ -418,7 +477,7 @@ pub fn build_diff(repo: &Repo, base: &BaseRef) -> Result<DiffReport> {
         .collect();
 
     Ok(DiffReport {
-        repository: context(repo, base),
+        repository: context(repo, base, &repo.resolve_baseline(&SinceSpec::Base, base)?),
         files_changed: stats.len(),
         stats: total(&stats),
         groups,
@@ -488,7 +547,7 @@ pub fn build_inspect(
         .collect();
 
     Ok(InspectReport {
-        repository: context(repo, base),
+        repository: context(repo, base, &repo.resolve_baseline(&SinceSpec::Base, base)?),
         last_modified: if exists { mtime(&abs) } else { None },
         path: rel,
         tracked,

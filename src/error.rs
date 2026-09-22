@@ -49,6 +49,9 @@ pub enum TrailError {
     #[error("invalid trail edit: {0}\n  no changes were applied")]
     InvalidEdit(String),
 
+    #[error("cannot resolve baseline: {0}\n  hint: --since accepts push, upstream, base, auto or a revision")]
+    NoBaseline(String),
+
     #[error("snapshot unavailable: {0}")]
     SnapshotUnavailable(String),
 
