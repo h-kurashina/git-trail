@@ -13,6 +13,7 @@ use crate::edit;
 use crate::git::baseline::SinceSpec;
 use crate::git::repository::Repo;
 use crate::recorder;
+use crate::review;
 use crate::trail::builder;
 
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -59,6 +60,34 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         | Some(Command::Sessions)
         | Some(Command::Open { at: None, .. }) => {
             unreachable!("handled above")
+        }
+        Some(Command::Review {
+            checkpoint,
+            file,
+            open,
+        }) => {
+            let trail = builder::build_trail(&repo, &base, &baseline, builder::Scope::Overview)?;
+            let report = review::build(&repo, &trail);
+            let Some(selector) = checkpoint else {
+                return emit(cli.json, &report, terminal::render_review);
+            };
+            let selected = review::select(&report, &selector)?;
+            let Some(file) = file else {
+                return emit(cli.json, selected, terminal::render_review_checkpoint);
+            };
+            let rel = repo.relative_path(&start, &file)?;
+            if open {
+                return Ok(edit::open_at(
+                    &repo,
+                    &trail,
+                    &start,
+                    &file,
+                    &selected.id,
+                    false,
+                )?);
+            }
+            let diff = review::file_diff(&repo, &report, selected, &rel)?;
+            emit(cli.json, &diff, terminal::render_review_file)
         }
         Some(Command::Changes) => {
             let report = builder::build_changes(&repo, &base, &baseline)?;

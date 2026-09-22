@@ -649,3 +649,166 @@ pub fn render_changes(report: &ChangesReport) -> String {
     );
     out
 }
+
+fn checkpoint_heading(cp: &crate::review::ReviewCheckpoint, style: &Style) -> String {
+    let title = cp
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Checkpoint {}", cp.number));
+    format!("[{}] {}", cp.number, style.bold(&title))
+}
+
+fn checkpoint_meta(cp: &crate::review::ReviewCheckpoint, style: &Style, out: &mut String) {
+    let _ = writeln!(
+        out,
+        "    {} - {}  {}",
+        local(&cp.started_at).format("%H:%M"),
+        local(&cp.ended_at).format("%H:%M"),
+        style.dim(&cp.id)
+    );
+    let _ = writeln!(
+        out,
+        "    {} file{}{}  {}",
+        cp.files.len(),
+        if cp.files.len() == 1 { "" } else { "s" },
+        if cp.bulk { " (bulk)" } else { "" },
+        plus_minus(&cp.stats)
+    );
+    if let Some(note) = &cp.annotation {
+        let _ = writeln!(out, "    {}", style.dim(note));
+    }
+}
+
+fn review_file_line(f: &crate::review::ReviewFile) -> String {
+    let mark = match f.kind {
+        ChangeKind::Created => "+",
+        ChangeKind::Modified => "~",
+        ChangeKind::Deleted => "-",
+        ChangeKind::Renamed => ">",
+    };
+    let name = match &f.from_path {
+        Some(from) => format!("{} -> {}", from.display(), f.path.display()),
+        None => f.path.display().to_string(),
+    };
+    let stat = if !f.snapshot {
+        "snapshot unavailable".to_string()
+    } else if f.binary {
+        "binary".to_string()
+    } else {
+        plus_minus(&LineStats {
+            additions: f.additions.unwrap_or(0),
+            deletions: f.deletions.unwrap_or(0),
+        })
+    };
+    format!("{mark} {name}  {stat}")
+}
+
+pub fn render_review(report: &crate::review::ReviewReport) -> String {
+    let style = Style::detect();
+    let ctx = &report.repository;
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Review"));
+    let _ = writeln!(out, "{}", ctx.head.label());
+    let _ = writeln!(out, "since {}", baseline_text(&ctx.since));
+    let _ = writeln!(out);
+    if report.checkpoints.is_empty() {
+        let _ = writeln!(
+            out,
+            "  {}",
+            style.dim("no recorded checkpoints in this window (run `trail start` while working)")
+        );
+        return out;
+    }
+    for cp in &report.checkpoints {
+        let _ = writeln!(out, "{}", checkpoint_heading(cp, &style));
+        checkpoint_meta(cp, &style, &mut out);
+        let _ = writeln!(out);
+        if cp.bulk {
+            let _ = writeln!(
+                out,
+                "    {}",
+                style.dim(&format!(
+                    "{} files (bulk, collapsed; `trail review {}` lists them)",
+                    cp.files.len(),
+                    cp.number
+                ))
+            );
+        } else {
+            for f in &cp.files {
+                let _ = writeln!(out, "    {}", review_file_line(f));
+            }
+        }
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out, "{SHORT_RULE}");
+    let _ = writeln!(
+        out,
+        "{} checkpoint{}, {} file{}, {}",
+        report.checkpoints.len(),
+        if report.checkpoints.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        report.files_changed,
+        if report.files_changed == 1 { "" } else { "s" },
+        plus_minus(&report.stats)
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        style
+            .dim("trail review <n>  |  trail review <n> <file>  |  trail review <n> <file> --open")
+    );
+    out
+}
+
+pub fn render_review_checkpoint(cp: &crate::review::ReviewCheckpoint) -> String {
+    let style = Style::detect();
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", checkpoint_heading(cp, &style));
+    checkpoint_meta(cp, &style, &mut out);
+    let _ = writeln!(out);
+    for f in &cp.files {
+        let _ = writeln!(out, "    {}", review_file_line(f));
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        style.dim(&format!(
+            "trail review {} <file>  shows what this checkpoint changed in a file",
+            cp.number
+        ))
+    );
+    out
+}
+
+pub fn render_review_file(report: &crate::review::FileDiffReport) -> String {
+    let style = Style::detect();
+    let cp = &report.checkpoint;
+    let f = &report.file;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}",
+        style.dim(&format!(
+            "checkpoint {} ({}){}  {}",
+            cp.number,
+            cp.id,
+            cp.title
+                .as_ref()
+                .map(|t| format!(" \"{t}\""))
+                .unwrap_or_default(),
+            review_file_line(f)
+        ))
+    );
+    if !f.snapshot {
+        let _ = writeln!(out, "snapshot unavailable for this change (recorded before snapshot support, larger than the cap, or pruned)");
+        return out;
+    }
+    out.push_str(&report.diff);
+    out
+}

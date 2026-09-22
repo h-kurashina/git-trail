@@ -33,6 +33,7 @@ trail start
 trail sessions
 trail edit
 trail open src/auth/service.ts
+trail review --since push
 ```
 
 Global options:
@@ -285,6 +286,47 @@ Opens a file of the worktree in `$VISUAL` / `$EDITOR`. With `--at`, the file
 is restored as it was when that checkpoint ended (its latest recorded version
 up to that point) into a temporary file and opened there; `--print` writes it
 to stdout instead. Checkpoint ids are shown by `trail history`.
+
+### `trail review`
+
+Reads the changes checkpoint by checkpoint instead of as one final diff.
+
+```bash
+trail review --since push          # numbered checkpoints in reading order
+trail review 2                     # files of checkpoint 2
+trail review 2 src/auth/service.ts # what checkpoint 2 changed in that file
+trail review 2 src/auth/service.ts --open   # the file at the end of checkpoint 2
+```
+
+```text
+Review
+feature/auth
+since last push to origin/feature/auth (8fa19d2)
+
+[1] Authentication foundation
+    13:04 - 13:10  01K5V9W4YV7A3ZK6QH0M8R2B4C.1
+    3 files  +91 -12
+
+    + src/auth/service.ts  +58
+    + src/session/store.ts  +31
+    ~ src/db/schema.ts  +2 -12
+
+[2] API integration
+    13:11 - 13:18  01K5V9W4YV7A3ZK6QH0M8R2B4C.2
+    2 files  +43 -16
+
+    ~ src/routes/auth.ts  +18 -4
+    ~ src/auth/service.ts  +25 -12
+
+────────────────────
+2 checkpoints, 4 files, +134 -28
+```
+
+The per-file view is a unified diff between the file's content just before
+the checkpoint and at its end, rebuilt from the snapshots. Git can only show
+`baseline..HEAD`; this shows each step in between. Numbers are stable for one
+`--since` window; hidden checkpoints (see `trail edit`) are skipped. Files
+recorded without snapshots are listed as `snapshot unavailable`.
 
 ### Snapshots
 
