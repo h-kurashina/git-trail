@@ -30,6 +30,12 @@ pub struct Cli {
 pub enum Command {
     /// Show a compact summary of the current worktree
     Status,
+    /// Show the development trail in detail (commits, reflog, working tree)
+    History {
+        /// Only show the most recent N events
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
     /// Show the diff against the base branch grouped by directory
     Diff,
     /// Show change information for a single file

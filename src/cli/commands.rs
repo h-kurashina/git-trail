@@ -29,6 +29,13 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let report = builder::build_status(&repo, &base)?;
             emit(cli.json, &report, terminal::render_status)
         }
+        Some(Command::History { limit }) => {
+            let mut trail = builder::build_trail(&repo, &base, builder::Scope::Detailed)?;
+            if let Some(n) = limit {
+                trail.truncate_to_latest(n);
+            }
+            emit(cli.json, &trail, terminal::render_history)
+        }
         Some(Command::Diff) => {
             let report = builder::build_diff(&repo, &base)?;
             emit(cli.json, &report, terminal::render_diff)

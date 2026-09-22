@@ -20,7 +20,8 @@ use crate::trail::{
 pub enum Scope {
     /// Commits since the base plus working tree changes (`trail`).
     Overview,
-    // Phase 2: `Detailed` adds reflog movements for `trail history`.
+    /// Overview plus reflog movements (`trail history`).
+    Detailed,
 }
 
 fn context(repo: &Repo, base: &BaseRef) -> RepositoryContext {
@@ -64,7 +65,7 @@ fn mtime(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(modified))
 }
 
-pub fn build_trail(repo: &Repo, base: &BaseRef, _scope: Scope) -> Result<Trail> {
+pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
     let entries = diff::status(repo.workdir())?;
     let commits = history::commits_between(repo.gix(), repo.head_id, base.merge_base)?;
     let head_stats = stats_since_head(repo, &entries)?;
@@ -133,6 +134,35 @@ pub fn build_trail(repo: &Repo, base: &BaseRef, _scope: Scope) -> Result<Trail> 
             stats,
             staged,
         });
+    }
+
+    // 3. Reflog: HEAD movements since the branch point (detailed view only).
+    if scope == Scope::Detailed {
+        let since = commits
+            .first()
+            .map(|c| c.time)
+            .or_else(|| events.iter().filter_map(|e| e.timestamp).min())
+            .unwrap_or_else(Utc::now);
+        for entry in history::head_reflog(repo.gix(), since)? {
+            // Plain commits are either already shown as Commit events or belong
+            // to another branch; only HEAD movements that are not commits are
+            // interesting here (checkout, rebase, reset, amend, merge, ...).
+            if entry.action == "commit" || entry.action == "commit (initial)" {
+                continue;
+            }
+            events.push(TrailEvent {
+                timestamp: Some(entry.time),
+                event_type: TrailEventType::RefUpdate {
+                    action: entry.action,
+                    message: entry.message,
+                },
+                files: Vec::new(),
+                source: EventSource::GitReflog,
+                confidence: Confidence::Exact,
+                stats: None,
+                staged: None,
+            });
+        }
     }
 
     // Chronological order; events without a time sink to the end.

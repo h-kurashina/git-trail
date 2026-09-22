@@ -150,6 +150,54 @@ fn files_of_commit(
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ReflogEntry {
+    pub time: DateTime<Utc>,
+    pub previous_id: String,
+    pub new_id: String,
+    /// e.g. "commit", "checkout", "rebase (finish)", "reset"
+    pub action: String,
+    pub message: String,
+}
+
+/// Entries of the HEAD reflog newer than `since`, oldest first.
+/// A missing reflog (e.g. `core.logAllRefUpdates=false`) yields an empty list.
+pub fn head_reflog(repo: &gix::Repository, since: DateTime<Utc>) -> Result<Vec<ReflogEntry>> {
+    let head = repo.head().map_err(|e| TrailError::Git(e.to_string()))?;
+    let mut platform = head.log_iter();
+    let mut entries = Vec::new();
+    let Some(iter) = platform.rev().map_err(TrailError::Io)? else {
+        return Ok(entries);
+    };
+    for line in iter {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue, // a corrupt line should not hide the rest
+        };
+        let time = Utc
+            .timestamp_opt(line.signature.time.seconds, 0)
+            .single()
+            .unwrap_or_default();
+        if time < since {
+            break;
+        }
+        let message = line.message.to_str_lossy().into_owned();
+        let (action, detail) = match message.split_once(": ") {
+            Some((a, d)) => (a.to_string(), d.to_string()),
+            None => (message.clone(), String::new()),
+        };
+        entries.push(ReflogEntry {
+            time,
+            previous_id: line.previous_oid.to_string(),
+            new_id: line.new_oid.to_string(),
+            action,
+            message: detail,
+        });
+    }
+    entries.reverse();
+    Ok(entries)
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct FileCommit {
     pub id: String,
     pub short_id: String,

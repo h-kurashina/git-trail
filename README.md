@@ -25,6 +25,7 @@ trail needs a `git` executable on `PATH`.
 ```bash
 trail
 trail status
+trail history
 trail diff
 trail inspect src/auth/service.ts
 ```
@@ -74,6 +75,13 @@ A compact view of the worktree: branch, base, how many commits you are ahead,
 and counts for modified / added / deleted / renamed / untracked as well as
 staged / unstaged.
 
+### `trail history`
+
+The detailed trail. In addition to commits and working tree changes it shows
+HEAD movements from the reflog (checkout, rebase, reset, amend, merge) and tags
+each working tree event with its line stats, staging state and whether its time
+came from the file's mtime.
+
 ### `trail diff`
 
 Line statistics against the base branch, grouped by directory. Untracked files
@@ -90,6 +98,7 @@ base are marked with `*`.
 trail never talks to the network and never sends anything anywhere. It reads:
 
 * commits reachable from HEAD but not from the base branch (via [gix](https://github.com/GitoxideLabs/gitoxide))
+* the HEAD reflog
 * the index and working tree (`git status`, `git diff --numstat`)
 * file modification times
 
@@ -117,6 +126,7 @@ cargo build
 cargo test
 cargo run -- status
 cargo run -- diff
+cargo run -- history
 ```
 
 Integration tests create temporary repositories and worktrees with the `git`
