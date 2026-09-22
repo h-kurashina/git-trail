@@ -38,6 +38,20 @@ pub enum TrailError {
     #[error("{0} is not tracked and does not exist in the working tree")]
     FileNotFound(PathBuf),
 
+    #[error(
+        "no editor configured\n  hint: set $VISUAL or $EDITOR (for example: export EDITOR=nvim)"
+    )]
+    NoEditor,
+
+    #[error("editor failed: {0}\n  no changes were applied")]
+    EditorFailed(String),
+
+    #[error("invalid trail edit: {0}\n  no changes were applied")]
+    InvalidEdit(String),
+
+    #[error("{0} is not available yet")]
+    NotImplemented(String),
+
     #[error("git {command} failed: {stderr}")]
     GitCommand { command: String, stderr: String },
 
