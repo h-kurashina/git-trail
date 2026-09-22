@@ -538,9 +538,10 @@ pub fn render_sessions(report: &SessionsReport) -> String {
         let _ = writeln!(out, "  {} - {end}", start.format("%Y-%m-%d %H:%M"));
         let _ = writeln!(
             out,
-            "  {} checkpoint{}",
+            "  {} checkpoint{}{}",
             s.checkpoints,
-            if s.checkpoints == 1 { "" } else { "s" }
+            if s.checkpoints == 1 { "" } else { "s" },
+            if s.snapshots { "" } else { "  (no snapshots)" }
         );
         let _ = writeln!(out);
     }

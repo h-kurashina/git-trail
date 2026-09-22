@@ -62,9 +62,12 @@ pub enum Command {
     Open {
         /// File path, relative to the current directory or the repository root
         file: PathBuf,
-        /// Open the file as it was at a checkpoint (not available yet)
+        /// Open the file as it was at a checkpoint (see `trail history` for ids)
         #[arg(long, value_name = "CHECKPOINT")]
         at: Option<String>,
+        /// Write the content to stdout instead of opening an editor
+        #[arg(long)]
+        print: bool,
     },
     /// Show change information for a single file
     Inspect {

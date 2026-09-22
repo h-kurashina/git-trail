@@ -360,6 +360,7 @@ pub fn build_sessions(repo: &Repo) -> Result<SessionsReport> {
             checkpoints: build_checkpoints(&s.header.session_id, &s.records).len(),
             last_activity: s.last_activity(),
             worktree_exists: s.header.worktree_path.is_dir(),
+            snapshots: crate::recorder::snapshot::has_snapshots(repo.gix(), &s.header.session_id),
             session_id: s.header.session_id,
             worktree_id: s.header.worktree_id,
             worktree_path: s.header.worktree_path,
