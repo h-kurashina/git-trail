@@ -744,6 +744,28 @@ fn sessions_are_listed_after_the_worktree_is_removed() {
             .count(),
         2
     );
+
+    // A new, unrelated branch that reuses the name does not inherit the
+    // trail: the session's start_head is not part of its history.
+    git(&f.root, &["checkout", "-q", "main"]);
+    git(&f.root, &["branch", "-D", "agent"]);
+    git(&f.root, &["checkout", "-q", "--orphan", "agent"]);
+    git(&f.root, &["commit", "-qm", "fresh start"]);
+    git(&f.root, &["branch", "-f", "main", "agent"]); // give the orphan a base
+    write(&f.root, "x.txt", "x\n");
+    git(&f.root, &["add", "-A"]);
+    git(&f.root, &["commit", "-qm", "on the new agent branch"]);
+    let history = trail_json(&f.root, &["history"]);
+    assert_eq!(
+        history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "checkpoint")
+            .count(),
+        0,
+        "{history:#?}"
+    );
 }
 
 #[test]
