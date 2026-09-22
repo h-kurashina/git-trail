@@ -112,7 +112,7 @@ Worktree
   feature/auth
 
 Session
-  20260922-051926-353
+  01K5V9W4YV7A3ZK6QH0M8R2B4C
 
 Press Ctrl+C to stop.
 
@@ -135,7 +135,7 @@ Sessions are append-only JSONL files under
 before and after the change:
 
 ```json
-{"kind":"session","version":1,"session_id":"20260922-051926-353","repository_root":"/…/my-project","worktree_id":"main","worktree_path":"/…/my-project","branch":"feature/auth","base_commit":"17c881b…","start_head":"2b86c0e…","started_at":"…"}
+{"kind":"session","version":1,"session_id":"01K5V9W4YV7A3ZK6QH0M8R2B4C","repository_root":"/…/my-project","worktree_id":"main","worktree_path":"/…/my-project","branch":"feature/auth","base_commit":"17c881b…","start_head":"2b86c0e…","started_at":"…"}
 {"kind":"event","timestamp":"…","path":"src/auth/service.ts","type":"modified","before_hash":"70e5878…","after_hash":"40fcf65…"}
 {"kind":"event","timestamp":"…","path":"src/auth/helpers.ts","type":"renamed","from_path":"src/auth/util.ts","before_hash":"9a1…","after_hash":"9a1…"}
 {"kind":"end","ended_at":"…","events":2}
