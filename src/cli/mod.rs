@@ -36,7 +36,12 @@ pub enum Command {
     Status,
     /// Show what changed since the last push (or upstream, or base)
     Changes,
-    /// Review the trail checkpoint by checkpoint, with per-checkpoint diffs
+    /// Review how the worktree came to be: commits, their checkpoints, diffs
+    ///
+    /// Selectors: `2` is the second section (a commit, or the working tree,
+    /// which is always last); `2.3` is the third checkpoint that led to it.
+    /// Checkpoint ids and commit id prefixes work too.
+    #[command(verbatim_doc_comment)]
     Review {
         /// Section number (a commit or the working tree), checkpoint label
         /// (<section>.<n>), checkpoint id or commit id

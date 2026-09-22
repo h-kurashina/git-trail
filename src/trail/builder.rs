@@ -150,9 +150,11 @@ pub fn build_trail(
 
     // 3. Reflog: HEAD movements since the branch point (detailed view only).
     if scope == Scope::Detailed {
-        let since = commits
-            .first()
-            .map(|c| c.time)
+        // Movements since the branch point. The baseline commit is a lower
+        // bound the checkout that created the branch can never precede;
+        // the first commit's time can (same-second boundaries).
+        let since = commit_time(repo, baseline.start)
+            .or_else(|| commits.first().map(|c| c.time))
             .or_else(|| events.iter().filter_map(|e| e.timestamp).min())
             .unwrap_or_else(Utc::now);
         for entry in history::head_reflog(repo.gix(), since)? {
@@ -242,12 +244,37 @@ pub fn build_trail(
         });
     }
 
-    // Chronological order; events without a time sink to the end.
-    events.sort_by(|a, b| match (a.timestamp, b.timestamp) {
-        (Some(x), Some(y)) => x.cmp(&y),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
+    // Chronological order; events without a time sink to the end. Commit
+    // times have second precision, so within one second git's own order
+    // (oldest first) decides between commits, a checkpoint sorts right
+    // before the commit it led to, and everything else comes after the
+    // commits of that second.
+    let commit_slot: HashMap<&str, (usize, DateTime<Utc>)> = commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), (i, c.time)))
+        .collect();
+    let after_commits = commits.len();
+    let key = |e: &TrailEvent| -> (Option<DateTime<Utc>>, usize, u8) {
+        match &e.event_type {
+            TrailEventType::Commit { id, .. } => {
+                let slot = commit_slot.get(id.as_str()).map_or(after_commits, |s| s.0);
+                (e.timestamp, slot, 1)
+            }
+            TrailEventType::Checkpoint {
+                commit: Some(id), ..
+            } => match commit_slot.get(id.as_str()) {
+                Some((slot, at)) => (e.timestamp.map(|ts| ts.min(*at)), *slot, 0),
+                None => (e.timestamp, after_commits, 1),
+            },
+            _ => (e.timestamp, after_commits, 1),
+        }
+    };
+    events.sort_by(|a, b| match (key(a), key(b)) {
+        ((Some(x), sa, ra), (Some(y), sb, rb)) => x.cmp(&y).then(sa.cmp(&sb)).then(ra.cmp(&rb)),
+        ((Some(_), ..), (None, ..)) => std::cmp::Ordering::Less,
+        ((None, ..), (Some(_), ..)) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
     });
 
     apply_order(&mut events, &metadata.order);
