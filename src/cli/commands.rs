@@ -3,17 +3,21 @@
 //! Each command builds a serializable report, then hands it either to the
 //! terminal renderer or to `serde_json`. This is what keeps `--json` cheap.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
 use super::{Cli, Command};
 use crate::display::{terminal, write_stdout};
 use crate::edit;
-use crate::error::Result;
+use crate::error::{Result, TrailError};
 use crate::git::baseline::{Baseline, SinceSpec};
+use crate::git::history;
 use crate::git::repository::{BaseRef, Repo};
 use crate::recorder;
 use crate::review;
 use crate::trail::builder::{self, Scope};
+use crate::trail::worktrees;
 use crate::tui;
 
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -70,36 +74,82 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 print,
             )?)
         }
+        Some(Command::Worktrees) => {
+            let report = worktrees::build_worktrees(&repo, cli.base.as_deref())?;
+            emit(json, &report, terminal::render_worktrees)
+        }
         Some(Command::Review {
-            checkpoint,
+            selector,
             file,
             open,
             interactive,
+            commit,
+            worktree,
         }) => {
-            let trail = overview(&window(SinceSpec::Base)?)?;
-            let report = review::build(&repo, &trail);
-            if interactive {
-                return Ok(tui::run(&repo, &trail, report, &start)?);
-            }
-            let Some(selector) = checkpoint else {
-                return emit(json, &report, terminal::render_review);
+            // Another worktree: resolve everything against it instead.
+            let target = match &worktree {
+                Some(sel) => worktrees::resolve_worktree(&repo, sel)?,
+                None => repo.clone_handle(),
             };
-            let selected = review::select(&report, &selector)?;
+            let current = target.worktree_id() == repo.worktree_id();
+            let repo = &target;
+            let base = repo.resolve_base(cli.base.as_deref())?;
+            let baseline = repo.resolve_baseline(&SinceSpec::parse(cli.since.as_deref()), &base)?;
+            let trail = builder::build_trail(repo, &base, &baseline, Scope::Overview)?;
+            let review = review::build(repo, &trail, current)?;
+            if interactive {
+                return Ok(tui::run(repo, &trail, review, &start)?);
+            }
+            if let Some(rev) = commit {
+                // `--commit <rev> <file>`: the only positional is the file.
+                let file = match (selector, file) {
+                    (Some(sel), None) => Some(PathBuf::from(sel)),
+                    (Some(_), Some(_)) => {
+                        return Err(TrailError::InvalidSelection(
+                            "--commit takes a file, not a section selector".into(),
+                        )
+                        .into())
+                    }
+                    (None, file) => file,
+                };
+                let id = repo.rev_parse(&rev)?;
+                let section = match review::section_of_commit(&review, &id.to_string()) {
+                    Some(c) => c.clone(),
+                    None => {
+                        // Outside the window: still a fact worth showing.
+                        let info = history::commit_info(repo.gix(), id)?;
+                        review::commit_review(repo, 0, &info, Vec::new())
+                    }
+                };
+                let Some(file) = file else {
+                    return emit(json, &section, terminal::render_commit);
+                };
+                let rel = repo.relative_path(&start, &file)?;
+                let selected =
+                    review::Selected::Section(&review::ReviewSection::Commit(section.clone()));
+                if open {
+                    return Ok(edit::open_selected(repo, &trail, &start, &file, selected)?);
+                }
+                let diff = review::file_diff(repo, &review, selected, &rel)?;
+                return emit(json, &diff, terminal::render_review_file);
+            }
+            let Some(selector) = selector else {
+                return emit(json, &review, terminal::render_review);
+            };
+            let selected = review::select(&review, &selector)?;
             let Some(file) = file else {
-                return emit(json, selected, terminal::render_review_checkpoint);
+                return match selected {
+                    review::Selected::Section(s) => emit(json, s, terminal::render_section),
+                    review::Selected::Checkpoint(cp) => {
+                        emit(json, cp, terminal::render_review_checkpoint)
+                    }
+                };
             };
             if open {
-                return Ok(edit::open_at(
-                    &repo,
-                    &trail,
-                    &start,
-                    &file,
-                    &selected.id,
-                    false,
-                )?);
+                return Ok(edit::open_selected(repo, &trail, &start, &file, selected)?);
             }
             let rel = repo.relative_path(&start, &file)?;
-            let diff = review::file_diff(&repo, &report, selected, &rel)?;
+            let diff = review::file_diff(repo, &review, selected, &rel)?;
             emit(json, &diff, terminal::render_review_file)
         }
         // `trail changes` defaults to the last push; everything else to the base branch.

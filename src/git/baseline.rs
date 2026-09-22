@@ -91,13 +91,9 @@ impl Repo {
                 .ok_or_else(|| TrailError::NoBaseline("this branch has no upstream".into()))?,
             SinceSpec::Base => base_branch(base),
             SinceSpec::Rev(rev) => {
-                let id = self
-                    .gix()
-                    .rev_parse_single(rev.as_bytes())
-                    .map_err(|_| {
-                        TrailError::NoBaseline(format!("'{rev}' is not a known revision"))
-                    })?
-                    .detach();
+                let id = self.rev_parse(rev).map_err(|_| {
+                    TrailError::NoBaseline(format!("'{rev}' is not a known revision"))
+                })?;
                 (
                     BaselineKind::Commit,
                     format!("commit {}", self.short_id(&id)),

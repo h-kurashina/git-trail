@@ -254,6 +254,16 @@ pub fn numstat(workdir: &Path, rev: &str, paths: &[&Path]) -> Result<Vec<FileSta
     Ok(parse_numstat(&out))
 }
 
+/// Unified diff of one tracked file, `rev` against the working tree.
+pub fn unified(workdir: &Path, rev: &str, path: &Path) -> Result<String> {
+    let path = path.to_string_lossy();
+    let out = run_git(
+        workdir,
+        &["diff", "--no-color", "--no-ext-diff", rev, "--", &path],
+    )?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// Count lines of untracked files so they can join the totals as pure additions.
 /// Files that look binary (NUL in the first 8 KiB) report `None`.
 pub fn untracked_stats(workdir: &Path, entries: &[StatusEntry]) -> Vec<FileStat> {

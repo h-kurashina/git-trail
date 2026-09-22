@@ -97,7 +97,7 @@ pub fn session_dir(repo: &Repo) -> PathBuf {
 /// Identifier of the worktree inside the trail store: the linked worktree's
 /// id under `.git/worktrees/`, or `main` for the main worktree.
 pub fn worktree_id(repo: &Repo) -> String {
-    repo.worktree.id.clone().unwrap_or_else(|| "main".into())
+    repo.worktree_id()
 }
 
 /// ULID: millisecond timestamp plus 80 random bits, so ids sort by time and

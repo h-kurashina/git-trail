@@ -519,6 +519,58 @@ pub fn open_file(repo: &Repo, cwd: &Path, file: &Path, print: bool) -> Result<()
     editor::Editor::resolve()?.open(&abs)
 }
 
+/// `trail review <selection> <file> --open`: a checkpoint opens the file as
+/// it was when the checkpoint ended, a commit opens the file as committed,
+/// the working tree opens the file itself.
+pub fn open_selected(
+    repo: &Repo,
+    trail: &Trail,
+    cwd: &Path,
+    file: &Path,
+    selected: crate::review::Selected<'_>,
+) -> Result<()> {
+    use crate::review::{ReviewSection, Selected};
+    match selected {
+        Selected::Checkpoint(cp) => open_at(repo, trail, cwd, file, &cp.id, false),
+        Selected::Section(ReviewSection::WorkingTree(_)) => open_file(repo, cwd, file, false),
+        Selected::Section(ReviewSection::Commit(c)) => {
+            let rel = repo.relative_path(cwd, file)?;
+            let entry = c.files.iter().find(|f| f.path == rel).ok_or_else(|| {
+                TrailError::InvalidSelection(format!(
+                    "{} is not part of commit {} ({})",
+                    rel.display(),
+                    c.number,
+                    c.short_id
+                ))
+            })?;
+            let Some(data) = crate::review::blob_at_commit(repo, entry)? else {
+                return Err(TrailError::SnapshotUnavailable(format!(
+                    "{} was deleted by commit {}",
+                    rel.display(),
+                    c.short_id
+                )));
+            };
+            open_temp(&rel, &c.short_id, &data)
+        }
+    }
+}
+
+/// Write `data` to a temporary file named after `rel` and open it.
+fn open_temp(rel: &Path, tag: &str, data: &[u8]) -> Result<()> {
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir().join(format!(
+        "trail-{}-{}-{name}",
+        tag.replace('/', "_"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, data).map_err(|e| TrailError::from_io(e, &tmp))?;
+    eprintln!("{} at {tag} -> {}", rel.display(), tmp.display());
+    editor::Editor::resolve()?.open(&tmp)
+}
+
 /// `trail open <file> --at <checkpoint>`: the file as it was when that
 /// checkpoint ended, restored from the snapshot blobs in the object database.
 pub fn open_at(
@@ -575,18 +627,7 @@ pub fn open_at(
     if print {
         return write_stdout(&data);
     }
-    let name = rel
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = std::env::temp_dir().join(format!(
-        "trail-{}-{}-{name}",
-        checkpoint.replace('/', "_"),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, &data).map_err(|e| TrailError::from_io(e, &tmp))?;
-    eprintln!("{} at {checkpoint} -> {}", rel.display(), tmp.display());
-    editor::Editor::resolve()?.open(&tmp)
+    open_temp(&rel, checkpoint, &data)
 }
 
 fn write_stdout(data: &[u8]) -> Result<()> {
