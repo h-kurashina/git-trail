@@ -232,6 +232,29 @@ pub fn render_trail(trail: &Trail) -> String {
     out
 }
 
+pub fn render_history(trail: &Trail) -> String {
+    let style = Style::detect();
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Development Trail (detailed)"));
+    let _ = writeln!(out, "{RULE}");
+    let _ = writeln!(out);
+    head_line(&trail.repository, &style, &mut out);
+    let _ = writeln!(
+        out,
+        "{}",
+        style.dim(&format!(
+            "since merge base {}  (commits, HEAD reflog, working tree)",
+            trail.repository.merge_base
+        ))
+    );
+    let _ = writeln!(out);
+    events_block(&trail.events, true, &style, &mut out);
+    let _ = writeln!(out);
+    summary_block(trail, &mut out);
+    out
+}
+
 pub fn render_status(report: &StatusReport) -> String {
     let style = Style::detect();
     let ctx = &report.repository;
