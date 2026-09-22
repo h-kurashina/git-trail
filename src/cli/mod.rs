@@ -36,6 +36,16 @@ pub enum Command {
     Status,
     /// Show what changed since the last push (or upstream, or base)
     Changes,
+    /// Review the trail checkpoint by checkpoint, with per-checkpoint diffs
+    Review {
+        /// Checkpoint number (from `trail review`) or id
+        checkpoint: Option<String>,
+        /// File within the checkpoint: prints the diff this checkpoint made
+        file: Option<PathBuf>,
+        /// Open the file as it was at the end of the checkpoint in $VISUAL / $EDITOR
+        #[arg(long)]
+        open: bool,
+    },
     /// Show the development trail in detail (commits, reflog, working tree)
     History {
         /// Only show the most recent N events

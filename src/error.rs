@@ -52,6 +52,9 @@ pub enum TrailError {
     #[error("cannot resolve baseline: {0}\n  hint: --since accepts push, upstream, base, auto or a revision")]
     NoBaseline(String),
 
+    #[error("{0}")]
+    InvalidSelection(String),
+
     #[error("snapshot unavailable: {0}")]
     SnapshotUnavailable(String),
 
