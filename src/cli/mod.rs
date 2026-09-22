@@ -49,6 +49,23 @@ pub enum Command {
     },
     /// List recorded development sessions (including removed worktrees)
     Sessions,
+    /// Edit checkpoint titles, notes, grouping and order in $VISUAL / $EDITOR
+    Edit {
+        /// Apply an already edited trail file instead of opening an editor
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
+        /// Print the editable text to stdout and exit
+        #[arg(long)]
+        print: bool,
+    },
+    /// Open a file of the worktree in $VISUAL / $EDITOR
+    Open {
+        /// File path, relative to the current directory or the repository root
+        file: PathBuf,
+        /// Open the file as it was at a checkpoint (not available yet)
+        #[arg(long, value_name = "CHECKPOINT")]
+        at: Option<String>,
+    },
     /// Show change information for a single file
     Inspect {
         /// File path, relative to the current directory or the repository root

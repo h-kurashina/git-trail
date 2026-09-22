@@ -31,6 +31,10 @@ pub enum ChangeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileChange {
+    /// Id of the checkpoint the recorder put this change in. Stays the same
+    /// when a human moves the change to another checkpoint, so overlay edits
+    /// can always be traced back to the raw log.
+    pub origin: String,
     pub path: PathBuf,
     pub kind: ChangeKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,7 +80,8 @@ impl Checkpoint {
         }
     }
 
-    fn absorb(&mut self, change: FileChange) {
+    fn absorb(&mut self, mut change: FileChange) {
+        change.origin = self.id.clone();
         self.ended_at = self.ended_at.max(change.last_seen);
         match self.changes.iter_mut().find(|c| c.path == change.path) {
             Some(existing) => fold(existing, &change),
@@ -98,6 +103,7 @@ impl Checkpoint {
 
 fn change_from(event: &RawEvent) -> FileChange {
     FileChange {
+        origin: String::new(), // filled in when the change joins a checkpoint
         path: event.path.clone(),
         kind: match event.kind {
             RawEventKind::Created => ChangeKind::Created,

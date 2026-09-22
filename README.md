@@ -30,6 +30,8 @@ trail diff
 trail inspect src/auth/service.ts
 trail start
 trail sessions
+trail edit
+trail open src/auth/service.ts
 ```
 
 Global options:
@@ -192,6 +194,58 @@ Development Sessions
   7 checkpoints
 ```
 
+### `trail edit`
+
+Opens the Development Trail of the current branch in `$VISUAL` (then
+`$EDITOR`) as plain text, the way oil.nvim turns a directory into a buffer.
+Your editor runs exactly as configured; trail adds nothing to it.
+
+```text
+# trail://feature/auth
+# Editing this file changes Trail metadata.
+# File contents and Git history are not modified.
+
+# commit a82fbc1  Add authentication foundation
+
+[checkpoint:20260922-053305-c02.1]
+title = Session storage
+hidden = false
+
+src/session/store.ts
+src/auth/service.ts
+
+[checkpoint:20260922-053305-c02.2]
+title = Tests
+hidden = false
+note = written after the API was wired
+
+tests/auth.test.ts
+```
+
+Save and quit, and trail parses the buffer back:
+
+* `title =` and `note =` label a checkpoint
+* `hidden = true` removes it from the text views (it stays in `--json`)
+* move a file line into another checkpoint to regroup it
+* reorder the checkpoint blocks to change their reading order
+
+Files cannot be removed or invented and commits cannot be edited; every such
+attempt, and any syntax error, is rejected before anything is written. Edits
+go to `<common git dir>/trail/metadata/checkpoints.json`, written atomically.
+The raw session logs are never modified, so deleting the metadata file
+restores the recorder's view. `trail edit --print` shows the buffer,
+`trail edit --from <file>` applies one without an editor.
+
+### `trail open`
+
+```bash
+trail open src/auth/service.ts
+```
+
+Opens a file of the worktree in `$VISUAL` / `$EDITOR`. `--at <checkpoint>`
+is reserved for opening the file as it was at a checkpoint; that needs
+snapshot storage and is not available yet.
+
 ## How it works
 
 trail never talks to the network and never sends anything anywhere. It reads:
@@ -200,7 +254,7 @@ trail never talks to the network and never sends anything anywhere. It reads:
 * the HEAD reflog
 * the index and working tree (`git status`, `git diff --numstat`)
 * file modification times
-* sessions recorded by `trail start`
+* sessions recorded by `trail start`, with the edits made in `trail edit`
 
 Every event carries a `source` and a `confidence`. Commit and reflog times are
 exact. Working tree events only have the file's mtime, which is recorded as

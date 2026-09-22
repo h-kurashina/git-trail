@@ -10,6 +10,7 @@ use crate::git::diff::{self, ChangeKind, DiffTarget, FileStat, LineStats, Status
 use crate::git::history;
 use crate::git::repository::{BaseRef, Repo};
 use crate::recorder::checkpoint::{build_checkpoints, Checkpoint};
+use crate::recorder::metadata::Metadata;
 use crate::recorder::store::{self, SessionFile};
 use crate::trail::event::{Confidence, EventSource, TrailEvent, TrailEventType};
 use crate::trail::{
@@ -171,7 +172,7 @@ pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
     //    checkpoint covers a file, the mtime-based guess for that file is
     //    dropped so nothing is shown twice.
     let since = merge_base_time(repo, base);
-    let checkpoints = recorded_checkpoints(repo, since)?;
+    let (checkpoints, metadata) = recorded_checkpoints(repo, since)?;
     let mut covered: HashMap<&Path, DateTime<Utc>> = HashMap::new();
     for (cp, covered_until) in &checkpoints {
         for change in &cp.changes {
@@ -222,6 +223,8 @@ pub fn build_trail(repo: &Repo, base: &BaseRef, scope: Scope) -> Result<Trail> {
         (None, None) => std::cmp::Ordering::Equal,
     });
 
+    apply_order(&mut events, &metadata.order);
+
     let summary = TrailSummary {
         changes: events.iter().filter(|e| e.is_change()).count(),
         files_changed: base_stats.len(),
@@ -257,24 +260,73 @@ fn sessions_for(repo: &Repo) -> Result<Vec<SessionFile>> {
         .collect())
 }
 
-/// Checkpoints of the relevant sessions since the branch point, paired with
-/// the time until which their session is known to have been watching.
+/// A checkpoint plus the time until which its session kept watching.
+type CoveredCheckpoint = (Checkpoint, DateTime<Utc>);
+
+/// Checkpoints of the relevant sessions since the branch point, with the
+/// metadata overlay applied, paired with the time until which their session
+/// is known to have been watching.
 fn recorded_checkpoints(
     repo: &Repo,
     since: Option<DateTime<Utc>>,
-) -> Result<Vec<(Checkpoint, DateTime<Utc>)>> {
-    let mut out = Vec::new();
+) -> Result<(Vec<CoveredCheckpoint>, Metadata)> {
+    let mut raw = Vec::new();
+    let mut covered_by_session: HashMap<String, DateTime<Utc>> = HashMap::new();
     for session in sessions_for(repo)? {
         // An open session (no end record) is assumed to still be watching.
-        let covered_until = session.ended_at.unwrap_or_else(Utc::now);
-        for cp in build_checkpoints(&session.header.session_id, &session.records) {
-            if since.is_some_and(|s| cp.ended_at < s) {
-                continue;
-            }
-            out.push((cp, covered_until));
-        }
+        covered_by_session.insert(
+            session.header.session_id.clone(),
+            session.ended_at.unwrap_or_else(Utc::now),
+        );
+        raw.extend(build_checkpoints(
+            &session.header.session_id,
+            &session.records,
+        ));
     }
-    Ok(out)
+    let metadata = Metadata::load(&repo.worktree.common_dir)?;
+    let out = metadata
+        .apply(raw)
+        .into_iter()
+        .filter(|cp| !since.is_some_and(|s| cp.ended_at < s))
+        .map(|cp| {
+            let until = covered_by_session
+                .get(&cp.session_id)
+                .copied()
+                .unwrap_or_else(Utc::now);
+            (cp, until)
+        })
+        .collect();
+    Ok((out, metadata))
+}
+
+/// Apply the human reading order: checkpoints listed in `order` are permuted
+/// among the timeline slots they occupy; everything else stays put.
+fn apply_order(events: &mut [TrailEvent], order: &[String]) {
+    if order.is_empty() {
+        return;
+    }
+    let slots: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| match &e.event_type {
+            TrailEventType::Checkpoint { id, .. } => order.contains(id),
+            _ => false,
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if slots.len() < 2 {
+        return;
+    }
+    let mut taken: Vec<TrailEvent> = slots.iter().map(|i| events[*i].clone()).collect();
+    taken.sort_by_key(|e| match &e.event_type {
+        TrailEventType::Checkpoint { id, .. } => {
+            order.iter().position(|o| o == id).unwrap_or(usize::MAX)
+        }
+        _ => usize::MAX,
+    });
+    for (slot, event) in slots.into_iter().zip(taken) {
+        events[slot] = event;
+    }
 }
 
 pub fn build_sessions(repo: &Repo) -> Result<SessionsReport> {
