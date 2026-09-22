@@ -15,6 +15,7 @@ use crate::git::repository::Repo;
 use crate::recorder;
 use crate::review;
 use crate::trail::builder;
+use crate::tui;
 
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let start = match &cli.path {
@@ -65,9 +66,13 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             checkpoint,
             file,
             open,
+            interactive,
         }) => {
             let trail = builder::build_trail(&repo, &base, &baseline, builder::Scope::Overview)?;
             let report = review::build(&repo, &trail);
+            if interactive {
+                return Ok(tui::run(&repo, &trail, report, &start)?);
+            }
             let Some(selector) = checkpoint else {
                 return emit(cli.json, &report, terminal::render_review);
             };
