@@ -39,11 +39,29 @@ pub enum TrailEventType {
         annotation: Option<String>,
         bulk: bool,
         hidden: bool,
+        /// The HEAD movement the recorder saw after this checkpoint, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        boundary: Option<crate::recorder::checkpoint::CommitBoundary>,
+        /// The reviewed commit this checkpoint was work towards; `None` means
+        /// it is still uncommitted (working tree). See `trail::attach`.
+        commit: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attachment: Option<Attachment>,
         changes: Vec<crate::recorder::checkpoint::FileChange>,
     },
     // Extension points (not implemented yet):
     // AgentSession { tool: String, ... }  -- Claude Code / Codex session events
     // LogicalGroup { title: String, ... } -- `trail why`
+}
+
+/// How a checkpoint was tied to its commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Attachment {
+    /// The recorder watched the commit being made.
+    Recorded,
+    /// Matched by author time or by order in time.
+    Inferred,
 }
 
 /// Where the event was reconstructed from.

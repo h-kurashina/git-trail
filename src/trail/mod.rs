@@ -5,8 +5,10 @@
 //! (coding agent sessions, file watcher, SQLite cache) only need to produce
 //! `TrailEvent`s; nothing in `display/` has to change.
 
+pub mod attach;
 pub mod builder;
 pub mod event;
+pub mod worktrees;
 
 use std::path::PathBuf;
 
@@ -42,6 +44,18 @@ pub enum ChangedFileKind {
     Renamed,
 }
 
+impl ChangedFileKind {
+    /// One-character marker used in file lists: `+ ~ - >`.
+    pub fn mark(self) -> &'static str {
+        match self {
+            ChangedFileKind::Added => "+",
+            ChangedFileKind::Modified => "~",
+            ChangedFileKind::Deleted => "-",
+            ChangedFileKind::Renamed => ">",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangedFile {
     #[serde(flatten)]
@@ -66,6 +80,12 @@ pub struct ChangesReport {
 pub struct TrailSummary {
     /// Number of change events (commits and working tree changes).
     pub changes: usize,
+    /// Commits since the baseline.
+    pub commits: usize,
+    /// Visible recorded checkpoints, committed or not.
+    pub checkpoints: usize,
+    /// Visible checkpoints not yet part of any commit (working tree).
+    pub uncommitted_checkpoints: usize,
     /// Distinct files that differ between the merge base and the working tree.
     pub files_changed: usize,
     pub additions: u64,

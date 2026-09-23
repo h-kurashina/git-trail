@@ -12,7 +12,7 @@ pub mod history;
 pub mod repository;
 pub mod worktree;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Result, TrailError};
@@ -51,6 +51,23 @@ pub(crate) fn run_git(workdir: &Path, args: &[&str]) -> Result<Vec<u8>> {
             stderr,
         })
     }
+}
+
+/// Resolve `.` and `..` segments without touching the filesystem (symlinks
+/// are left alone). Used for user supplied paths and for the `..` segments
+/// gix produces when it resolves `commondir` files.
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Split NUL separated output into owned strings (lossy UTF-8).

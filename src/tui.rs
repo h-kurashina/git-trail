@@ -1,10 +1,15 @@
 //! `trail review -i`: an interactive review browser.
 //!
-//! Three levels, one state machine: Checkpoints → Files → Diff. Wide
-//! terminals show all three side by side; narrow ones show the current level
-//! only. The browser owns no review logic: it displays a `ReviewReport` and
-//! asks the review module for diffs, and hands file opening to the same code
-//! path as `trail open --at`.
+//! Three levels, one state machine: Development → Files → Diff. The
+//! Development pane is a tree of sections (commits, then the working tree)
+//! with their checkpoints; Files lists what the selected node changed; Diff
+//! shows one file, or a whole node. Wide terminals show all three side by
+//! side; narrow ones show the current level only. The state is the same in
+//! both, only the layout differs.
+//!
+//! The browser owns no review logic: it displays a `WorktreeReview`, asks
+//! the review module for diffs through a callback, and opens files through
+//! the same code path as `trail review ... --open`.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -16,9 +21,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use crate::display::plural;
 use crate::error::{Result, TrailError};
 use crate::git::repository::Repo;
-use crate::review::{self, ReviewCheckpoint, ReviewReport};
+use crate::review::{self, DiffTarget, FileRow, ReviewSection, Selected, WorktreeReview};
 use crate::trail::Trail;
 
 /// Terminals at least this wide get the three-pane layout.
@@ -26,7 +32,7 @@ pub const WIDE_LAYOUT_MIN_COLUMNS: u16 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
-    Checkpoints,
+    Development,
     Files,
     Diff,
 }
@@ -38,8 +44,40 @@ pub enum Key {
     Enter,
     Back,
     Diff,
+    CommitDiff,
     Open,
     Quit,
+}
+
+/// A row of the Development tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Node {
+    /// Index into `review.sections`.
+    Section(usize),
+    /// Section index, checkpoint index within it.
+    Checkpoint(usize, usize),
+}
+
+impl Node {
+    pub fn section(self) -> usize {
+        match self {
+            Node::Section(s) | Node::Checkpoint(s, _) => s,
+        }
+    }
+}
+
+/// What to open outside the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenTarget {
+    /// The file as it was at the end of the checkpoint (snapshot).
+    Snapshot {
+        checkpoint_id: String,
+        path: PathBuf,
+    },
+    /// The file as committed (blob of the commit tree).
+    CommitFile { section: usize, path: PathBuf },
+    /// The file in the working tree.
+    WorktreeFile { path: PathBuf },
 }
 
 /// What the loop must do after a key was handled.
@@ -47,83 +85,195 @@ pub enum Key {
 pub enum Effect {
     None,
     Quit,
-    /// Leave the TUI, open `path` as it was at the end of `checkpoint_id`,
-    /// then come back.
-    Open {
-        checkpoint_id: String,
-        path: PathBuf,
-    },
+    /// Leave the TUI, open the target, then come back.
+    Open(OpenTarget),
 }
 
 pub struct App {
-    pub report: ReviewReport,
+    pub review: WorktreeReview,
     pub level: Level,
-    pub checkpoint: usize,
+    /// Cursor in the visible tree rows.
+    pub cursor: usize,
+    /// One flag per section.
+    pub expanded: Vec<bool>,
     pub file: usize,
-    /// Diff lines of the selected file, loaded on demand.
+    /// Diff lines of what was last requested, loaded on demand.
     pub diff: Vec<String>,
+    pub diff_title: String,
+    /// True when the diff belongs to the selected file (Back returns to
+    /// Files); false when it belongs to the whole node (Back returns to the
+    /// tree).
+    pub diff_of_file: bool,
     pub scroll: usize,
     pub status: Option<String>,
 }
 
 impl App {
-    pub fn new(report: ReviewReport) -> Self {
+    pub fn new(review: WorktreeReview) -> Self {
+        let expanded = vec![true; review.sections.len()];
         App {
-            report,
-            level: Level::Checkpoints,
-            checkpoint: 0,
+            review,
+            level: Level::Development,
+            cursor: 0,
+            expanded,
             file: 0,
             diff: Vec::new(),
+            diff_title: String::new(),
+            diff_of_file: false,
             scroll: 0,
             status: None,
         }
     }
 
-    pub fn current_checkpoint(&self) -> Option<&ReviewCheckpoint> {
-        self.report.checkpoints.get(self.checkpoint)
+    /// Visible rows of the tree, in order.
+    pub fn nodes(&self) -> Vec<Node> {
+        let mut out = Vec::new();
+        for (i, section) in self.review.sections.iter().enumerate() {
+            out.push(Node::Section(i));
+            if self.expanded[i] {
+                for j in 0..section.checkpoints().len() {
+                    out.push(Node::Checkpoint(i, j));
+                }
+            }
+        }
+        out
     }
 
-    pub fn current_file(&self) -> Option<&review::ReviewFile> {
-        self.current_checkpoint()?.files.get(self.file)
+    pub fn current_node(&self) -> Option<Node> {
+        self.nodes().get(self.cursor).copied()
     }
 
-    /// Advance the state machine. `load_diff` is only called when entering
-    /// the diff level, so listing stays cheap.
+    fn section(&self, i: usize) -> &ReviewSection {
+        &self.review.sections[i]
+    }
+
+    /// Files of the current node.
+    pub fn file_rows(&self) -> Vec<FileRow> {
+        match self.current_node() {
+            Some(Node::Section(i)) => self.section(i).file_rows(),
+            Some(Node::Checkpoint(i, j)) => self.section(i).checkpoints()[j].file_rows(),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn current_file(&self) -> Option<FileRow> {
+        self.file_rows().into_iter().nth(self.file)
+    }
+
+    /// The diff the current node stands for as a whole.
+    fn node_diff_target(&self) -> Option<(DiffTarget, String)> {
+        match self.current_node()? {
+            Node::Section(i) => match self.section(i) {
+                ReviewSection::Commit(c) => Some((
+                    DiffTarget::Commit { section: c.number },
+                    format!("commit {} {}", c.short_id, c.summary),
+                )),
+                ReviewSection::WorkingTree(_) => {
+                    Some((DiffTarget::WorkingTree, "working tree".to_string()))
+                }
+            },
+            Node::Checkpoint(i, j) => {
+                let cp = &self.section(i).checkpoints()[j];
+                Some((
+                    DiffTarget::Checkpoint {
+                        label: cp.label.clone(),
+                    },
+                    format!("checkpoint {} {}", cp.label, cp.display_title()),
+                ))
+            }
+        }
+    }
+
+    /// The diff of the selected file within the current node.
+    fn file_diff_target(&self) -> Option<(DiffTarget, String)> {
+        let row = self.current_file()?;
+        let title = row.path.display().to_string();
+        let target = match self.current_node()? {
+            Node::Section(i) => match self.section(i) {
+                ReviewSection::Commit(c) => DiffTarget::CommitFile {
+                    section: c.number,
+                    path: row.path,
+                },
+                ReviewSection::WorkingTree(_) => DiffTarget::WorkingTreeFile { path: row.path },
+            },
+            Node::Checkpoint(i, j) => DiffTarget::CheckpointFile {
+                label: self.section(i).checkpoints()[j].label.clone(),
+                path: row.path,
+            },
+        };
+        Some((target, title))
+    }
+
+    /// The commit the current node belongs to, if any.
+    fn commit_diff_target(&self) -> Option<(DiffTarget, String)> {
+        let i = self.current_node()?.section();
+        let c = self.section(i).as_commit()?;
+        Some((
+            DiffTarget::Commit { section: c.number },
+            format!("commit {} {}", c.short_id, c.summary),
+        ))
+    }
+
+    /// Advance the state machine. `load_diff` is only called when a diff is
+    /// requested, so browsing stays cheap.
     pub fn handle(
         &mut self,
         key: Key,
-        load_diff: &mut dyn FnMut(&ReviewCheckpoint, &Path) -> Result<String>,
+        load_diff: &mut dyn FnMut(&DiffTarget) -> Result<String>,
     ) -> Effect {
         self.status = None;
         match (self.level, key) {
             (_, Key::Quit) => return Effect::Quit,
+            (_, Key::CommitDiff) => match self.commit_diff_target() {
+                Some((target, title)) => self.show_diff(target, title, false, load_diff),
+                None => self.status = Some("the working tree has no commit diff yet".into()),
+            },
 
-            (Level::Checkpoints, Key::Down) => self.move_checkpoint(1),
-            (Level::Checkpoints, Key::Up) => self.move_checkpoint(-1),
-            (Level::Checkpoints, Key::Enter) => {
-                self.enter_files();
-            }
-            (Level::Checkpoints, Key::Diff) => {
-                if self.enter_files() {
-                    self.enter_diff(load_diff);
+            (Level::Development, Key::Down) => self.move_cursor(1),
+            (Level::Development, Key::Up) => self.move_cursor(-1),
+            (Level::Development, Key::Enter) => match self.current_node() {
+                Some(Node::Section(i)) if !self.expanded[i] => self.expanded[i] = true,
+                Some(_) => {
+                    self.enter_files();
                 }
-            }
-            (Level::Checkpoints, Key::Back) => return Effect::Quit,
-            (Level::Checkpoints, Key::Open) => {
+                None => self.status = Some("nothing to review".into()),
+            },
+            (Level::Development, Key::Back) => match self.current_node() {
+                Some(Node::Checkpoint(i, _)) => {
+                    self.cursor = self
+                        .nodes()
+                        .iter()
+                        .position(|n| *n == Node::Section(i))
+                        .unwrap_or(0);
+                }
+                Some(Node::Section(i)) if self.expanded[i] => {
+                    self.expanded[i] = false;
+                    self.clamp_cursor();
+                }
+                _ => return Effect::Quit,
+            },
+            (Level::Development, Key::Diff) => match self.node_diff_target() {
+                Some((target, title)) => self.show_diff(target, title, false, load_diff),
+                None => self.status = Some("nothing to review".into()),
+            },
+            (Level::Development, Key::Open) => {
                 self.status = Some("select a file first (Enter)".into());
             }
 
             (Level::Files, Key::Down) => self.move_file(1),
             (Level::Files, Key::Up) => self.move_file(-1),
-            (Level::Files, Key::Enter) | (Level::Files, Key::Diff) => self.enter_diff(load_diff),
-            (Level::Files, Key::Back) => self.level = Level::Checkpoints,
-            (Level::Files, Key::Open) | (Level::Diff, Key::Open) => {
-                if let (Some(cp), Some(file)) = (self.current_checkpoint(), self.current_file()) {
-                    return Effect::Open {
-                        checkpoint_id: cp.id.clone(),
-                        path: file.path.clone(),
-                    };
+            (Level::Files, Key::Enter) | (Level::Files, Key::Diff) => {
+                match self.file_diff_target() {
+                    Some((target, title)) => self.show_diff(target, title, true, load_diff),
+                    None => self.status = Some("no file selected".into()),
                 }
+            }
+            (Level::Files, Key::Back) => self.level = Level::Development,
+            (Level::Files, Key::Open) | (Level::Diff, Key::Open) => {
+                if let Some(target) = self.open_target() {
+                    return Effect::Open(target);
+                }
+                self.status = Some("select a file first (Enter)".into());
             }
 
             (Level::Diff, Key::Down) => {
@@ -132,30 +282,63 @@ impl App {
                 }
             }
             (Level::Diff, Key::Up) => self.scroll = self.scroll.saturating_sub(1),
-            (Level::Diff, Key::Back) => self.level = Level::Files,
+            (Level::Diff, Key::Back) => {
+                self.level = if self.diff_of_file {
+                    Level::Files
+                } else {
+                    Level::Development
+                };
+            }
             (Level::Diff, Key::Enter) | (Level::Diff, Key::Diff) => {}
         }
         Effect::None
     }
 
-    fn move_checkpoint(&mut self, delta: isize) {
-        let len = self.report.checkpoints.len();
+    fn open_target(&self) -> Option<OpenTarget> {
+        if !self.diff_of_file && self.level == Level::Diff {
+            return None;
+        }
+        let row = self.current_file()?;
+        Some(match self.current_node()? {
+            Node::Section(i) => match self.section(i) {
+                ReviewSection::Commit(c) => OpenTarget::CommitFile {
+                    section: c.number,
+                    path: row.path,
+                },
+                ReviewSection::WorkingTree(_) => OpenTarget::WorktreeFile { path: row.path },
+            },
+            Node::Checkpoint(i, j) => OpenTarget::Snapshot {
+                checkpoint_id: self.section(i).checkpoints()[j].id.clone(),
+                path: row.path,
+            },
+        })
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let len = self.nodes().len();
         if len == 0 {
             return;
         }
-        let next = (self.checkpoint as isize + delta).clamp(0, len as isize - 1) as usize;
-        if next != self.checkpoint {
-            self.checkpoint = next;
+        let next = (self.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        if next != self.cursor {
+            self.cursor = next;
             self.file = 0;
             self.diff.clear();
         }
     }
 
+    /// Keep the cursor on a visible row after the tree changed shape.
+    fn clamp_cursor(&mut self) {
+        let len = self.nodes().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
     fn move_file(&mut self, delta: isize) {
-        let len = self
-            .current_checkpoint()
-            .map(|c| c.files.len())
-            .unwrap_or(0);
+        let len = self.file_rows().len();
         if len == 0 {
             return;
         }
@@ -167,32 +350,31 @@ impl App {
     }
 
     fn enter_files(&mut self) -> bool {
-        match self.current_checkpoint() {
-            Some(cp) if !cp.files.is_empty() => {
-                self.level = Level::Files;
-                true
-            }
-            _ => {
-                self.status = Some("no checkpoints to review".into());
-                false
-            }
+        if self.file_rows().is_empty() {
+            self.status = Some("no files in this selection".into());
+            return false;
         }
+        self.file = self.file.min(self.file_rows().len() - 1);
+        self.level = Level::Files;
+        true
     }
 
-    fn enter_diff(
+    fn show_diff(
         &mut self,
-        load_diff: &mut dyn FnMut(&ReviewCheckpoint, &Path) -> Result<String>,
+        target: DiffTarget,
+        title: String,
+        of_file: bool,
+        load_diff: &mut dyn FnMut(&DiffTarget) -> Result<String>,
     ) {
-        let (Some(cp), Some(file)) = (self.current_checkpoint(), self.current_file()) else {
-            return;
-        };
-        match load_diff(cp, &file.path) {
+        match load_diff(&target) {
             Ok(text) => {
                 self.diff = if text.is_empty() {
-                    vec!["(no diff: snapshot unavailable or binary)".to_string()]
+                    vec!["(no diff: snapshot unavailable, binary, or nothing changed)".to_string()]
                 } else {
                     text.lines().map(String::from).collect()
                 };
+                self.diff_title = title;
+                self.diff_of_file = of_file;
                 self.scroll = 0;
                 self.level = Level::Diff;
             }
@@ -207,45 +389,25 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Char('k') | KeyCode::Up => Some(Key::Up),
         KeyCode::Enter | KeyCode::Char('l') => Some(Key::Enter),
         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Backspace => Some(Key::Back),
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Key::Quit),
         KeyCode::Char('d') => Some(Key::Diff),
+        KeyCode::Char('c') => Some(Key::CommitDiff),
         KeyCode::Char('o') => Some(Key::Open),
         KeyCode::Char('q') => Some(Key::Quit),
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Key::Quit),
         _ => None,
     }
 }
 
 /// Run the browser until the user quits.
-pub fn run(repo: &Repo, trail: &Trail, report: ReviewReport, cwd: &Path) -> Result<()> {
+pub fn run(repo: &Repo, trail: &Trail, review: WorktreeReview, cwd: &Path) -> Result<()> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(TrailError::NotATerminal);
     }
-    let mut app = App::new(report);
-    let mut load_diff = |cp: &ReviewCheckpoint, path: &Path| -> Result<String> {
-        // `report` is borrowed by `app`; rebuild the lookup from the ids.
-        let file = cp.files.iter().find(|f| f.path == path).ok_or_else(|| {
-            TrailError::InvalidSelection(format!("{} is not in the checkpoint", path.display()))
-        })?;
-        let before = file.before_hash.as_deref().and_then(|h| {
-            crate::recorder::snapshot::read_blob(repo.gix(), h)
-                .ok()
-                .flatten()
-        });
-        let after = file.after_hash.as_deref().and_then(|h| {
-            crate::recorder::snapshot::read_blob(repo.gix(), h)
-                .ok()
-                .flatten()
-        });
-        if !file.snapshot {
-            return Ok(String::new());
-        }
-        Ok(review::unified_diff(
-            &file.path,
-            file.from_path.as_deref(),
-            before.as_deref(),
-            after.as_deref(),
-        ))
-    };
+    let mut app = App::new(review);
+    // The loader borrows a snapshot of the review: it is immutable while the
+    // browser runs, so a clone is cheap and keeps `app` free to mutate.
+    let snapshot = app.review.clone();
+    let mut load_diff = |target: &DiffTarget| review::diff_for(repo, &snapshot, target);
 
     let mut terminal = ratatui::init();
     let outcome = loop {
@@ -266,12 +428,9 @@ pub fn run(repo: &Repo, trail: &Trail, report: ReviewReport, cwd: &Path) -> Resu
         match app.handle(mapped, &mut load_diff) {
             Effect::None => {}
             Effect::Quit => break Ok(()),
-            Effect::Open {
-                checkpoint_id,
-                path,
-            } => {
+            Effect::Open(target) => {
                 ratatui::restore();
-                let result = crate::edit::open_at(repo, trail, cwd, &path, &checkpoint_id, false);
+                let result = open(repo, trail, &snapshot, cwd, &target);
                 terminal = ratatui::init();
                 if let Err(err) = result {
                     app.status = Some(err.to_string());
@@ -281,6 +440,35 @@ pub fn run(repo: &Repo, trail: &Trail, report: ReviewReport, cwd: &Path) -> Resu
     };
     ratatui::restore();
     outcome
+}
+
+fn open(
+    repo: &Repo,
+    trail: &Trail,
+    review: &WorktreeReview,
+    cwd: &Path,
+    target: &OpenTarget,
+) -> Result<()> {
+    let root = repo.workdir();
+    match target {
+        OpenTarget::Snapshot {
+            checkpoint_id,
+            path,
+        } => crate::edit::open_at(repo, trail, cwd, &root.join(path), checkpoint_id, false),
+        OpenTarget::WorktreeFile { path } => {
+            crate::edit::open_file(repo, cwd, &root.join(path), false)
+        }
+        OpenTarget::CommitFile { section, path } => {
+            let s = review
+                .sections
+                .iter()
+                .find(|s| s.number() == *section)
+                .ok_or_else(|| {
+                    TrailError::InvalidSelection(format!("section {section} does not exist"))
+                })?;
+            crate::edit::open_selected(repo, trail, cwd, &root.join(path), Selected::Section(s))
+        }
+    }
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
@@ -296,17 +484,17 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(26),
                 Constraint::Percentage(30),
-                Constraint::Percentage(44),
+                Constraint::Percentage(28),
+                Constraint::Percentage(42),
             ])
             .split(body);
-        draw_checkpoints(frame, cols[0], app);
+        draw_development(frame, cols[0], app);
         draw_files(frame, cols[1], app);
         draw_diff(frame, cols[2], app);
     } else {
         match app.level {
-            Level::Checkpoints => draw_checkpoints(frame, body, app),
+            Level::Development => draw_development(frame, body, app),
             Level::Files => draw_files(frame, body, app),
             Level::Diff => draw_diff(frame, body, app),
         }
@@ -328,49 +516,100 @@ fn pane_block(title: &str, focused: bool) -> Block<'_> {
         .border_style(style)
 }
 
-fn draw_checkpoints(frame: &mut Frame, area: Rect, app: &App) {
-    let ctx = &app.report.repository;
+fn dim() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn draw_development(frame: &mut Frame, area: Rect, app: &App) {
+    let ctx = &app.review.repository;
     let title = format!(
-        " Checkpoints  {} since {} ",
+        " Development  {}{} since {} ",
         ctx.head.label(),
+        if app.review.worktree.exists {
+            ""
+        } else {
+            " (removed)"
+        },
         ctx.since.label
     );
-    let items: Vec<ListItem> = app
-        .report
-        .checkpoints
+    let nodes = app.nodes();
+    let items: Vec<ListItem> = nodes
         .iter()
-        .map(|cp| {
-            let name = cp
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("Checkpoint {}", cp.number));
-            let files = format!(
-                "{} file{}",
-                cp.files.len(),
-                if cp.files.len() == 1 { "" } else { "s" }
-            );
-            ListItem::new(vec![
-                Line::from(format!("[{}] {name}", cp.number)),
-                Line::from(Span::styled(
-                    format!(
-                        "    {} - {}  {files}  {}",
-                        cp.started_at.with_timezone(&chrono::Local).format("%H:%M"),
-                        cp.ended_at.with_timezone(&chrono::Local).format("%H:%M"),
-                        plus_minus(cp.stats.additions, cp.stats.deletions)
+        .map(|node| match *node {
+            Node::Section(i) => {
+                let s = &app.review.sections[i];
+                let arrow = if app.expanded[i] { "▼" } else { "▶" };
+                let cps = s.checkpoints().len();
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{arrow} [{}] {}  ", s.number(), s.heading())),
+                    Span::styled(
+                        format!("{} checkpoint{}  {}", cps, plural(cps), s.stats()),
+                        dim(),
                     ),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
+                ]))
+            }
+            Node::Checkpoint(i, j) => {
+                let s = &app.review.sections[i];
+                let cp = &s.checkpoints()[j];
+                let branch = if j + 1 == s.checkpoints().len() {
+                    "└"
+                } else {
+                    "├"
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!(
+                        "  {branch} [{}] {}  ",
+                        cp.label,
+                        cp.display_title()
+                    )),
+                    Span::styled(cp.stats.to_string(), dim()),
+                ]))
+            }
         })
         .collect();
     let empty = items.is_empty();
     let list = List::new(items)
-        .block(pane_block(&title, app.level == Level::Checkpoints))
+        .block(pane_block(&title, app.level == Level::Development))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
     let mut state = ListState::default();
     if !empty {
-        state.select(Some(app.checkpoint));
+        state.select(Some(app.cursor.min(nodes.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
+    let title = match app.current_node() {
+        Some(Node::Section(i)) => format!(" Files  [{}] ", app.review.sections[i].number()),
+        Some(Node::Checkpoint(i, j)) => format!(
+            " Files  [{}] ",
+            app.review.sections[i].checkpoints()[j].label
+        ),
+        None => " Files ".to_string(),
+    };
+    let rows = app.file_rows();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| {
+            let mut spans = vec![
+                Span::raw(format!("{} {}  ", row.mark, row.name)),
+                Span::styled(row.stat.clone(), dim()),
+            ];
+            if let Some(state) = row.state {
+                spans.push(Span::styled(format!("  {state}"), dim()));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let empty = items.is_empty();
+    let list = List::new(items)
+        .block(pane_block(&title, app.level == Level::Files))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    if !empty && app.level != Level::Development {
+        state.select(Some(app.file.min(rows.len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
     if empty {
@@ -380,76 +619,30 @@ fn draw_checkpoints(frame: &mut Frame, area: Rect, app: &App) {
             width: area.width.saturating_sub(4),
             height: 1,
         };
-        frame.render_widget(
-            Paragraph::new(
-                "no recorded checkpoints in this window (run `trail start` while working)",
-            ),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(Span::styled("no files", dim())), inner);
     }
-}
-
-fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
-    let title = match app.current_checkpoint() {
-        Some(cp) => format!(" Files  [{}] ", cp.number),
-        None => " Files ".to_string(),
-    };
-    let items: Vec<ListItem> = app
-        .current_checkpoint()
-        .map(|cp| {
-            cp.files
-                .iter()
-                .map(|f| {
-                    let mark = match f.kind {
-                        crate::recorder::checkpoint::ChangeKind::Created => "+",
-                        crate::recorder::checkpoint::ChangeKind::Modified => "~",
-                        crate::recorder::checkpoint::ChangeKind::Deleted => "-",
-                        crate::recorder::checkpoint::ChangeKind::Renamed => ">",
-                    };
-                    let stat = if !f.snapshot {
-                        "no snapshot".to_string()
-                    } else if f.binary {
-                        "binary".to_string()
-                    } else {
-                        plus_minus(f.additions.unwrap_or(0), f.deletions.unwrap_or(0))
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(format!("{mark} {}  ", f.path.display())),
-                        Span::styled(stat, Style::default().fg(Color::DarkGray)),
-                    ]))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let empty = items.is_empty();
-    let list = List::new(items)
-        .block(pane_block(&title, app.level == Level::Files))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("> ");
-    let mut state = ListState::default();
-    if !empty && app.level != Level::Checkpoints {
-        state.select(Some(app.file));
-    }
-    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_diff(frame: &mut Frame, area: Rect, app: &App) {
-    let title = match app.current_file() {
-        Some(f) if app.level == Level::Diff => format!(" Diff  {} ", f.path.display()),
-        _ => " Diff ".to_string(),
+    let title = if app.level == Level::Diff {
+        format!(" Diff  {} ", app.diff_title)
+    } else {
+        " Diff ".to_string()
     };
     let lines: Vec<Line> = if app.level == Level::Diff {
         app.diff
             .iter()
             .skip(app.scroll)
             .map(|l| {
-                let style = if l.starts_with('+') && !l.starts_with("+++") {
+                let style = if l.starts_with("+++") || l.starts_with("---") {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else if l.starts_with('+') {
                     Style::default().fg(Color::Green)
-                } else if l.starts_with('-') && !l.starts_with("---") {
+                } else if l.starts_with('-') {
                     Style::default().fg(Color::Red)
                 } else if l.starts_with("@@") {
                     Style::default().fg(Color::Cyan)
-                } else if l.starts_with("---") || l.starts_with("+++") {
+                } else if l.starts_with("diff --git") {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -459,8 +652,8 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App) {
             .collect()
     } else {
         vec![Line::from(Span::styled(
-            "Enter or d on a file shows what the checkpoint changed in it",
-            Style::default().fg(Color::DarkGray),
+            "d: diff of the selection   c: commit diff   Enter on a file: its diff",
+            dim(),
         ))]
     };
     frame.render_widget(
@@ -471,9 +664,11 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App, wide: bool) {
     let hints = match app.level {
-        Level::Checkpoints => "j/k move  Enter files  d diff  q quit",
-        Level::Files => "j/k move  Enter/d diff  o open at checkpoint  h/Esc back  q quit",
-        Level::Diff => "j/k scroll  o open at checkpoint  h/Esc back  q quit",
+        Level::Development => {
+            "j/k move  Enter expand/files  d diff  c commit diff  h/Esc collapse/back  q quit"
+        }
+        Level::Files => "j/k move  Enter/d diff  o open  c commit diff  h/Esc back  q quit",
+        Level::Diff => "j/k scroll  o open  c commit diff  h/Esc back  q quit",
     };
     let text = match &app.status {
         Some(status) => Line::from(Span::styled(
@@ -487,35 +682,29 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, wide: bool) {
                 format!(
                     "{}  ",
                     match app.level {
-                        Level::Checkpoints => "Checkpoints",
-                        Level::Files => "Checkpoints > Files",
-                        Level::Diff => "Checkpoints > Files > Diff",
+                        Level::Development => "Development",
+                        Level::Files => "Development > Files",
+                        Level::Diff => "Development > Files > Diff",
                     }
                 )
             };
             Line::from(vec![
                 Span::styled(position, Style::default().fg(Color::Cyan)),
-                Span::styled(hints, Style::default().fg(Color::DarkGray)),
+                Span::styled(hints, dim()),
             ])
         }
     };
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn plus_minus(additions: u64, deletions: u64) -> String {
-    match (additions, deletions) {
-        (0, 0) => "±0".into(),
-        (a, 0) => format!("+{a}"),
-        (0, d) => format!("-{d}"),
-        (a, d) => format!("+{a} -{d}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::diff::LineStats;
-    use crate::review::ReviewFile;
+    use crate::git::diff::{ChangeKind as GitChangeKind, LineStats};
+    use crate::review::{
+        CommitFile, CommitReview, ReviewCheckpoint, ReviewFile, ReviewSummary, ReviewWorktree,
+        WorkingTreeFile, WorkingTreeReview,
+    };
 
     fn file(path: &str) -> ReviewFile {
         ReviewFile {
@@ -532,21 +721,82 @@ mod tests {
         }
     }
 
-    fn checkpoint(number: usize, files: &[&str]) -> ReviewCheckpoint {
+    fn checkpoint(section: usize, number: usize, files: &[&str]) -> ReviewCheckpoint {
         ReviewCheckpoint {
+            section,
             number,
-            id: format!("s.{number}"),
+            label: format!("{section}.{number}"),
+            id: format!("s.{section}{number}"),
             title: None,
             annotation: None,
             started_at: chrono::Utc::now(),
             ended_at: chrono::Utc::now(),
             bulk: false,
+            attachment: None,
             files: files.iter().map(|f| file(f)).collect(),
             stats: LineStats::default(),
         }
     }
 
-    fn app(checkpoints: Vec<ReviewCheckpoint>) -> App {
+    fn commit(number: usize, checkpoints: Vec<ReviewCheckpoint>, files: &[&str]) -> ReviewSection {
+        ReviewSection::Commit(CommitReview {
+            number,
+            id: format!("{number:040}"),
+            short_id: format!("{number:07}"),
+            summary: format!("commit {number}"),
+            author: "t".into(),
+            time: chrono::Utc::now(),
+            is_merge: false,
+            diff_parent: None,
+            checkpoints,
+            files: files
+                .iter()
+                .map(|f| CommitFile {
+                    path: PathBuf::from(f),
+                    old_path: None,
+                    kind: GitChangeKind::Modified,
+                    before_id: Some("a".into()),
+                    after_id: Some("b".into()),
+                    additions: Some(1),
+                    deletions: Some(0),
+                    binary: false,
+                })
+                .collect(),
+            stats: LineStats::default(),
+        })
+    }
+
+    fn working_tree(
+        number: usize,
+        checkpoints: Vec<ReviewCheckpoint>,
+        files: &[&str],
+    ) -> ReviewSection {
+        ReviewSection::WorkingTree(WorkingTreeReview {
+            number,
+            available: true,
+            checkpoints,
+            files: files
+                .iter()
+                .map(|f| WorkingTreeFile {
+                    path: PathBuf::from(f),
+                    old_path: None,
+                    kind: GitChangeKind::Modified,
+                    staged: false,
+                    unstaged: true,
+                    untracked: false,
+                    additions: Some(1),
+                    deletions: Some(0),
+                    binary: false,
+                })
+                .collect(),
+            staged: 0,
+            unstaged: files.len(),
+            untracked: 0,
+            stats: LineStats::default(),
+        })
+    }
+
+    fn app(sections: Vec<ReviewSection>) -> App {
         let zero = gix::ObjectId::null(gix::hash::Kind::Sha1);
         let repo_ctx = crate::trail::RepositoryContext {
             name: "t".into(),
@@ -574,89 +824,251 @@ mod tests {
             },
             shallow: false,
         };
-        App::new(ReviewReport {
+        let checkpoints = sections
+            .iter()
+            .flat_map(|s| s.checkpoints().to_vec())
+            .collect();
+        App::new(WorktreeReview {
+            version: review::REVIEW_VERSION,
             repository: repo_ctx,
+            worktree: ReviewWorktree {
+                id: "main".into(),
+                path: PathBuf::from("/r"),
+                branch: Some("feature".into()),
+                exists: true,
+                current: true,
+            },
+            sections,
             checkpoints,
+            summary: ReviewSummary::default(),
             files_changed: 0,
             stats: LineStats::default(),
         })
     }
 
-    #[test]
-    fn navigates_checkpoints_files_and_diff() {
-        let mut a = app(vec![
-            checkpoint(1, &["a.rs", "b.rs"]),
-            checkpoint(2, &["c.rs"]),
-        ]);
-        let loads = std::cell::RefCell::new(Vec::new());
-        let mut load = |cp: &ReviewCheckpoint, p: &Path| {
-            loads
-                .borrow_mut()
-                .push(format!("{}:{}", cp.id, p.display()));
+    /// Two commits with two checkpoints each, one uncommitted checkpoint.
+    fn typical() -> App {
+        app(vec![
+            commit(
+                1,
+                vec![
+                    checkpoint(1, 1, &["a.rs", "b.rs"]),
+                    checkpoint(1, 2, &["c.rs"]),
+                ],
+                &["a.rs", "b.rs", "c.rs"],
+            ),
+            commit(
+                2,
+                vec![checkpoint(2, 1, &["d.rs"]), checkpoint(2, 2, &["e.rs"])],
+                &["d.rs", "e.rs"],
+            ),
+            working_tree(3, vec![checkpoint(3, 1, &["f.rs"])], &["f.rs"]),
+        ])
+    }
+
+    type Loads = std::rc::Rc<std::cell::RefCell<Vec<DiffTarget>>>;
+
+    fn recording_loader() -> (Loads, impl FnMut(&DiffTarget) -> Result<String>) {
+        let loads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let l = loads.clone();
+        let load = move |t: &DiffTarget| {
+            l.borrow_mut().push(t.clone());
             Ok("--- a\n+++ b\n@@\n-x\n+y\n".to_string())
         };
-        assert_eq!(a.handle(Key::Down, &mut load), Effect::None);
-        assert_eq!(a.checkpoint, 1);
-        a.handle(Key::Down, &mut load);
-        assert_eq!(a.checkpoint, 1, "clamped at the end");
-        a.handle(Key::Up, &mut load);
-        assert_eq!(a.checkpoint, 0);
-        a.handle(Key::Enter, &mut load);
-        assert_eq!(a.level, Level::Files);
-        a.handle(Key::Down, &mut load);
-        assert_eq!(a.file, 1);
-        a.handle(Key::Enter, &mut load);
-        assert_eq!(a.level, Level::Diff);
-        assert_eq!(a.diff.len(), 5);
-        a.handle(Key::Down, &mut load);
-        a.handle(Key::Down, &mut load);
-        assert_eq!(a.scroll, 2);
-        a.handle(Key::Back, &mut load);
-        assert_eq!(a.level, Level::Files);
-        a.handle(Key::Back, &mut load);
-        assert_eq!(a.level, Level::Checkpoints);
-        assert_eq!(a.handle(Key::Quit, &mut load), Effect::Quit);
-        assert_eq!(*loads.borrow(), vec!["s.1:b.rs".to_string()]);
+        (loads, load)
     }
 
     #[test]
-    fn open_and_diff_shortcuts() {
-        let mut a = app(vec![checkpoint(1, &["a.rs"])]);
-        let mut load = |_: &ReviewCheckpoint, _: &Path| Ok(String::new());
-        assert_eq!(a.handle(Key::Open, &mut load), Effect::None);
-        assert!(a.status.is_some(), "open needs a file");
-        a.handle(Key::Diff, &mut load);
-        assert_eq!(
-            a.level,
-            Level::Diff,
-            "d from checkpoints jumps to the first file's diff"
-        );
-        assert_eq!(
-            a.diff,
-            vec!["(no diff: snapshot unavailable or binary)".to_string()]
-        );
-        assert_eq!(
-            a.handle(Key::Open, &mut load),
-            Effect::Open {
-                checkpoint_id: "s.1".into(),
-                path: PathBuf::from("a.rs")
-            }
-        );
-        // Back at checkpoints level, Back quits.
+    fn tree_starts_expanded_and_collapses() {
+        let mut a = typical();
+        let (_, mut load) = recording_loader();
+        assert_eq!(a.nodes().len(), 3 + 5);
+        assert_eq!(a.current_node(), Some(Node::Section(0)));
+        // Back on an expanded commit collapses it.
         a.handle(Key::Back, &mut load);
+        assert!(!a.expanded[0]);
+        assert_eq!(a.nodes().len(), 3 + 3);
+        // Enter on a collapsed commit expands it again.
+        a.handle(Key::Enter, &mut load);
+        assert!(a.expanded[0]);
+        // Back on a collapsed top-level node quits.
         a.handle(Key::Back, &mut load);
         assert_eq!(a.handle(Key::Back, &mut load), Effect::Quit);
     }
 
     #[test]
-    fn empty_report_is_safe() {
-        let mut a = app(Vec::new());
-        let mut load = |_: &ReviewCheckpoint, _: &Path| Ok(String::new());
+    fn commit_to_checkpoint_to_files_to_diff() {
+        let mut a = typical();
+        let (loads, mut load) = recording_loader();
+        a.handle(Key::Down, &mut load);
+        assert_eq!(a.current_node(), Some(Node::Checkpoint(0, 0)));
+        a.handle(Key::Enter, &mut load);
+        assert_eq!(a.level, Level::Files);
+        assert_eq!(
+            a.file_rows()
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["a.rs", "b.rs"]
+        );
         a.handle(Key::Down, &mut load);
         a.handle(Key::Enter, &mut load);
-        assert_eq!(a.level, Level::Checkpoints);
+        assert_eq!(a.level, Level::Diff);
+        assert_eq!(
+            loads.borrow().last(),
+            Some(&DiffTarget::CheckpointFile {
+                label: "1.1".into(),
+                path: PathBuf::from("b.rs")
+            })
+        );
+        assert_eq!(a.diff.len(), 5);
+        a.handle(Key::Down, &mut load);
+        a.handle(Key::Down, &mut load);
+        assert_eq!(a.scroll, 2);
+        // Back from a file diff returns to Files, then to the tree.
+        a.handle(Key::Back, &mut load);
+        assert_eq!(a.level, Level::Files);
+        a.handle(Key::Back, &mut load);
+        assert_eq!(a.level, Level::Development);
+        // Back on a checkpoint jumps to its commit.
+        a.handle(Key::Back, &mut load);
+        assert_eq!(a.current_node(), Some(Node::Section(0)));
+        assert_eq!(a.handle(Key::Quit, &mut load), Effect::Quit);
+    }
+
+    #[test]
+    fn commit_files_and_commit_diff() {
+        let mut a = typical();
+        let (loads, mut load) = recording_loader();
+        // Enter on an expanded commit lists the commit's own files.
+        a.handle(Key::Enter, &mut load);
+        assert_eq!(a.level, Level::Files);
+        assert_eq!(a.file_rows().len(), 3);
+        a.handle(Key::Down, &mut load);
+        a.handle(Key::Down, &mut load);
+        a.handle(Key::Diff, &mut load);
+        assert_eq!(
+            loads.borrow().last(),
+            Some(&DiffTarget::CommitFile {
+                section: 1,
+                path: PathBuf::from("c.rs")
+            })
+        );
+        assert_eq!(
+            a.handle(Key::Open, &mut load),
+            Effect::Open(OpenTarget::CommitFile {
+                section: 1,
+                path: PathBuf::from("c.rs")
+            })
+        );
+        // `c` anywhere inside a commit shows the whole commit diff, and Back
+        // from it returns to where the user was.
+        a.handle(Key::Back, &mut load);
+        a.handle(Key::Back, &mut load);
+        a.handle(Key::Down, &mut load); // checkpoint 1.1
+        a.handle(Key::CommitDiff, &mut load);
+        assert_eq!(a.level, Level::Diff);
+        assert_eq!(
+            loads.borrow().last(),
+            Some(&DiffTarget::Commit { section: 1 })
+        );
+        assert!(!a.diff_of_file);
+        assert!(a.handle(Key::Open, &mut load) == Effect::None && a.status.is_some());
+        a.handle(Key::Back, &mut load);
+        assert_eq!(a.level, Level::Development);
+        assert_eq!(a.current_node(), Some(Node::Checkpoint(0, 0)));
+        // `d` on a checkpoint shows the checkpoint diff.
+        a.handle(Key::Diff, &mut load);
+        assert_eq!(
+            loads.borrow().last(),
+            Some(&DiffTarget::Checkpoint {
+                label: "1.1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn working_tree_node() {
+        let mut a = typical();
+        let (loads, mut load) = recording_loader();
+        for _ in 0..6 {
+            a.handle(Key::Down, &mut load);
+        }
+        assert_eq!(a.current_node(), Some(Node::Section(2)));
+        a.handle(Key::CommitDiff, &mut load);
+        assert_eq!(
+            a.level,
+            Level::Development,
+            "working tree has no commit diff"
+        );
         assert!(a.status.is_some());
         a.handle(Key::Diff, &mut load);
-        assert_eq!(a.level, Level::Checkpoints);
+        assert_eq!(loads.borrow().last(), Some(&DiffTarget::WorkingTree));
+        a.handle(Key::Back, &mut load);
+        a.handle(Key::Enter, &mut load);
+        assert_eq!(
+            a.handle(Key::Open, &mut load),
+            Effect::Open(OpenTarget::WorktreeFile {
+                path: PathBuf::from("f.rs")
+            })
+        );
+        a.handle(Key::Back, &mut load);
+        a.handle(Key::Down, &mut load); // checkpoint 3.1
+        a.handle(Key::Down, &mut load); // clamped at the end
+        assert_eq!(a.current_node(), Some(Node::Checkpoint(2, 0)));
+        a.handle(Key::Enter, &mut load);
+        assert_eq!(
+            a.handle(Key::Open, &mut load),
+            Effect::Open(OpenTarget::Snapshot {
+                checkpoint_id: "s.31".into(),
+                path: PathBuf::from("f.rs")
+            })
+        );
+    }
+
+    #[test]
+    fn empty_commit_and_commit_without_checkpoints() {
+        let mut a = app(vec![
+            commit(1, Vec::new(), &[]),
+            working_tree(2, Vec::new(), &[]),
+        ]);
+        let (_, mut load) = recording_loader();
+        assert_eq!(a.nodes().len(), 2);
+        a.handle(Key::Enter, &mut load);
+        assert_eq!(a.level, Level::Development, "no files to enter");
+        assert!(a.status.is_some());
+        a.handle(Key::Open, &mut load);
+        assert!(a.status.is_some());
+        a.handle(Key::Down, &mut load);
+        a.handle(Key::Down, &mut load);
+        assert_eq!(a.current_node(), Some(Node::Section(1)));
+        let mut empty = app(Vec::new());
+        empty.handle(Key::Down, &mut load);
+        empty.handle(Key::Enter, &mut load);
+        assert_eq!(empty.level, Level::Development);
+        assert!(empty.status.is_some());
+    }
+
+    #[test]
+    fn cursor_is_clamped_when_the_tree_shrinks() {
+        let mut a = typical();
+        let (_, mut load) = recording_loader();
+        for _ in 0..7 {
+            a.handle(Key::Down, &mut load);
+        }
+        assert_eq!(a.cursor, 7);
+        // Back on the last checkpoint jumps to its section, Back again
+        // collapses it: the cursor lands on the now-last row.
+        a.handle(Key::Back, &mut load);
+        a.handle(Key::Back, &mut load);
+        assert_eq!(a.current_node(), Some(Node::Section(2)));
+        assert_eq!(a.cursor, 6);
+        // Collapse everything else from above: cursor index stays visible.
+        a.cursor = 0;
+        a.handle(Key::Back, &mut load);
+        a.handle(Key::Down, &mut load);
+        a.handle(Key::Back, &mut load);
+        assert_eq!(a.nodes().len(), 3);
+        assert!(a.cursor < a.nodes().len());
     }
 }

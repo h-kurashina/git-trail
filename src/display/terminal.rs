@@ -6,15 +6,21 @@ use std::io::IsTerminal;
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 
+use super::plural;
 use crate::git::baseline::{Baseline, BaselineKind};
 use crate::git::diff::{FileStat, LineStats};
 use crate::git::repository::HeadState;
 use crate::git::worktree::WorktreeKind;
 use crate::recorder::checkpoint::ChangeKind;
-use crate::trail::event::{TrailEvent, TrailEventType};
+use crate::review::{
+    CommitReview, FileDiffReport, FileRow, ReviewCheckpoint, ReviewSection, WorkingTreeReview,
+    WorktreeReview,
+};
+use crate::trail::event::{Attachment, Confidence, EventSource, TrailEvent, TrailEventType};
+use crate::trail::worktrees::WorktreesReport;
 use crate::trail::{
-    ChangedFileKind, ChangesReport, DiffReport, InspectReport, RepositoryContext, SessionsReport,
-    StatusReport, Trail,
+    ChangesReport, DiffReport, InspectReport, RepositoryContext, SessionsReport, StatusReport,
+    Trail,
 };
 
 const RULE: &str = "────────────────────────────────────";
@@ -51,28 +57,27 @@ fn local(ts: &DateTime<Utc>) -> DateTime<Local> {
     ts.with_timezone(&Local)
 }
 
-fn plus_minus(stats: &LineStats) -> String {
-    match (stats.additions, stats.deletions) {
-        (0, 0) => "±0".to_string(),
-        (a, 0) => format!("+{a}"),
-        (0, d) => format!("-{d}"),
-        (a, d) => format!("+{a} -{d}"),
-    }
-}
-
 fn file_stat_text(stat: &FileStat) -> String {
     if stat.is_binary() {
         return "binary".to_string();
     }
-    plus_minus(&LineStats {
-        additions: stat.additions.unwrap_or(0),
-        deletions: stat.deletions.unwrap_or(0),
-    })
+    LineStats::from_counts(stat.additions, stat.deletions).to_string()
+}
+
+/// `old -> new` for renames, the path alone otherwise.
+fn path_text(path: &std::path::Path, from: Option<&std::path::Path>) -> String {
+    match from {
+        Some(from) => format!("{} -> {}", from.display(), path.display()),
+        None => path.display().to_string(),
+    }
 }
 
 fn head_line(ctx: &RepositoryContext, style: &Style, out: &mut String) {
     let _ = writeln!(out, "{}", style.bold("Repository"));
     let _ = writeln!(out, "  {}", ctx.name);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Worktree"));
+    let _ = writeln!(out, "  {}", ctx.head.label());
     if ctx.worktree.kind == WorktreeKind::Linked {
         let _ = writeln!(
             out,
@@ -81,9 +86,6 @@ fn head_line(ctx: &RepositoryContext, style: &Style, out: &mut String) {
             ctx.worktree.root.display()
         );
     }
-    let _ = writeln!(out);
-    let _ = writeln!(out, "{}", style.bold("Branch"));
-    let _ = writeln!(out, "  {}", ctx.head.label());
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", style.bold("Base"));
     let _ = writeln!(out, "  {}", ctx.base);
@@ -115,6 +117,23 @@ fn baseline_text(b: &Baseline) -> String {
     }
 }
 
+/// "2 created, 1 modified": how many changes of each kind a checkpoint holds.
+fn change_counts(changes: &[crate::recorder::checkpoint::FileChange]) -> String {
+    const KINDS: [(ChangeKind, &str); 4] = [
+        (ChangeKind::Created, "created"),
+        (ChangeKind::Modified, "modified"),
+        (ChangeKind::Deleted, "deleted"),
+        (ChangeKind::Renamed, "renamed"),
+    ];
+    KINDS
+        .iter()
+        .map(|(kind, label)| (changes.iter().filter(|c| c.kind == *kind).count(), label))
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn event_line(event: &TrailEvent, detailed: bool, style: &Style) -> String {
     let time = match &event.timestamp {
         Some(ts) => local(ts).format("%H:%M").to_string(),
@@ -134,10 +153,8 @@ fn event_line(event: &TrailEvent, detailed: bool, style: &Style) -> String {
             ..
         } => {
             let kind = if *is_merge { "Merged" } else { "Committed" };
-            let files = match event.files.len() {
-                1 => " (1 file)".to_string(),
-                n => format!(" ({n} files)"),
-            };
+            let n = event.files.len();
+            let files = format!(" ({n} file{})", plural(n));
             format!("{kind} {short_id} {summary}{}", style.dim(&files))
         }
         TrailEventType::Checkpoint {
@@ -147,27 +164,9 @@ fn event_line(event: &TrailEvent, detailed: bool, style: &Style) -> String {
             changes,
             ..
         } => {
-            let mut counts = [0usize; 4];
-            for c in changes {
-                counts[match c.kind {
-                    ChangeKind::Created => 0,
-                    ChangeKind::Modified => 1,
-                    ChangeKind::Deleted => 2,
-                    ChangeKind::Renamed => 3,
-                }] += 1;
-            }
-            let mut parts = Vec::new();
-            for (n, label) in counts
-                .iter()
-                .zip(["created", "modified", "deleted", "renamed"])
-            {
-                if *n > 0 {
-                    parts.push(format!("{n} {label}"));
-                }
-            }
             let what = match title {
                 Some(t) => format!("\"{t}\""),
-                None => parts.join(", "),
+                None => change_counts(changes),
             };
             let bulk_tag = if *bulk {
                 style.dim(&format!(" (bulk, {} files)", changes.len()))
@@ -189,20 +188,20 @@ fn event_line(event: &TrailEvent, detailed: bool, style: &Style) -> String {
     if detailed {
         let mut tags: Vec<String> = Vec::new();
         if let Some(stats) = &event.stats {
-            tags.push(plus_minus(stats));
+            tags.push(stats.to_string());
         }
         match event.staged {
             Some(true) => tags.push("staged".into()),
             Some(false) => tags.push("unstaged".into()),
             None => {
                 if matches!(event.event_type, TrailEventType::FileAdded)
-                    && event.source == crate::trail::event::EventSource::Filesystem
+                    && event.source == EventSource::Filesystem
                 {
                     tags.push("untracked".into());
                 }
             }
         }
-        if event.confidence == crate::trail::event::Confidence::Inferred {
+        if event.confidence == Confidence::Inferred {
             tags.push("time from mtime".into());
         }
         if !tags.is_empty() {
@@ -272,25 +271,12 @@ fn events_block(events: &[TrailEvent], detailed: bool, style: &Style, out: &mut 
                         );
                     } else {
                         for c in changes {
-                            let mark = match c.kind {
-                                ChangeKind::Created => "+",
-                                ChangeKind::Modified => "~",
-                                ChangeKind::Deleted => "-",
-                                ChangeKind::Renamed => ">",
-                            };
-                            match &c.from_path {
-                                Some(from) => {
-                                    let _ = writeln!(
-                                        out,
-                                        "         {mark} {} -> {}",
-                                        from.display(),
-                                        c.path.display()
-                                    );
-                                }
-                                None => {
-                                    let _ = writeln!(out, "         {mark} {}", c.path.display());
-                                }
-                            }
+                            let _ = writeln!(
+                                out,
+                                "         {} {}",
+                                c.kind.mark(),
+                                path_text(&c.path, c.from_path.as_deref())
+                            );
                         }
                     }
                 }
@@ -300,28 +286,47 @@ fn events_block(events: &[TrailEvent], detailed: bool, style: &Style, out: &mut 
     }
 }
 
+/// Worktree-centric counts shown above the timeline.
+fn overview_block(trail: &Trail, style: &Style, out: &mut String) {
+    let s = &trail.summary;
+    let _ = writeln!(out, "{}", style.bold("Commits"));
+    let _ = writeln!(out, "  {}", s.commits);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Working tree"));
+    let _ = writeln!(
+        out,
+        "  {} checkpoint{}",
+        s.uncommitted_checkpoints,
+        plural(s.uncommitted_checkpoints)
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Development history"));
+    let _ = writeln!(
+        out,
+        "  {} checkpoint{}",
+        s.checkpoints,
+        plural(s.checkpoints)
+    );
+    let _ = writeln!(out);
+}
+
 fn summary_block(trail: &Trail, out: &mut String) {
     let _ = writeln!(out, "{RULE}");
     let s = &trail.summary;
-    let _ = writeln!(
-        out,
-        "{} change{}",
-        s.changes,
-        if s.changes == 1 { "" } else { "s" }
-    );
+    let _ = writeln!(out, "{} change{}", s.changes, plural(s.changes));
     let _ = writeln!(
         out,
         "{} file{} changed",
         s.files_changed,
-        if s.files_changed == 1 { "" } else { "s" }
+        plural(s.files_changed)
     );
     let _ = writeln!(
         out,
         "{}",
-        plus_minus(&LineStats {
+        LineStats {
             additions: s.additions,
             deletions: s.deletions
-        })
+        }
     );
 }
 
@@ -333,6 +338,7 @@ pub fn render_trail(trail: &Trail) -> String {
     let _ = writeln!(out, "{RULE}");
     let _ = writeln!(out);
     head_line(&trail.repository, &style, &mut out);
+    overview_block(trail, &style, &mut out);
     events_block(&trail.events, false, &style, &mut out);
     let _ = writeln!(out);
     summary_block(trail, &mut out);
@@ -363,7 +369,6 @@ pub fn render_history(trail: &Trail) -> String {
 }
 
 pub fn render_status(report: &StatusReport) -> String {
-    let style = Style::detect();
     let ctx = &report.repository;
     let c = &report.counts;
     let mut out = String::new();
@@ -394,8 +399,7 @@ pub fn render_status(report: &StatusReport) -> String {
     let _ = writeln!(out, "Staged: {}", c.staged);
     let _ = writeln!(out, "Unstaged: {}", c.unstaged);
     let _ = writeln!(out);
-    let _ = writeln!(out, "{}", plus_minus(&report.stats));
-    let _ = style; // reserved for future colouring
+    let _ = writeln!(out, "{}", report.stats);
     out
 }
 
@@ -423,14 +427,7 @@ pub fn render_diff(report: &DiffReport) -> String {
         let _ = writeln!(out, "{SHORT_RULE}");
         let _ = writeln!(out);
         for file in &group.files {
-            match &file.old_path {
-                Some(old) => {
-                    let _ = writeln!(out, "{} -> {}", old.display(), file.path.display());
-                }
-                None => {
-                    let _ = writeln!(out, "{}", file.path.display());
-                }
-            }
+            let _ = writeln!(out, "{}", path_text(&file.path, file.old_path.as_deref()));
             let _ = writeln!(out, "  {}", file_stat_text(file));
             let _ = writeln!(out);
         }
@@ -440,8 +437,8 @@ pub fn render_diff(report: &DiffReport) -> String {
         out,
         "{} file{} changed, {}",
         report.files_changed,
-        if report.files_changed == 1 { "" } else { "s" },
-        plus_minus(&report.stats)
+        plural(report.files_changed),
+        report.stats
     );
     out
 }
@@ -560,7 +557,7 @@ pub fn render_sessions(report: &SessionsReport) -> String {
             out,
             "  {} checkpoint{}{}",
             s.checkpoints,
-            if s.checkpoints == 1 { "" } else { "s" },
+            plural(s.checkpoints),
             if s.snapshots { "" } else { "  (no snapshots)" }
         );
         let _ = writeln!(out);
@@ -600,12 +597,7 @@ pub fn render_changes(report: &ChangesReport) -> String {
         let _ = writeln!(out, "  {}", style.dim("none"));
     }
     for f in &report.files {
-        let mark = match f.kind {
-            ChangedFileKind::Added => "+",
-            ChangedFileKind::Modified => "~",
-            ChangedFileKind::Deleted => "-",
-            ChangedFileKind::Renamed => ">",
-        };
+        let mark = f.kind.mark();
         let state = match &f.status {
             Some(s) if s.untracked => "untracked",
             Some(s) if s.staged.is_some() && s.unstaged.is_some() => "staged, unstaged",
@@ -613,10 +605,7 @@ pub fn render_changes(report: &ChangesReport) -> String {
             Some(_) => "unstaged",
             None => "committed",
         };
-        let name = match &f.stat.old_path {
-            Some(old) => format!("{} -> {}", old.display(), f.stat.path.display()),
-            None => f.stat.path.display().to_string(),
-        };
+        let name = path_text(&f.stat.path, f.stat.old_path.as_deref());
         let _ = writeln!(out, "  {mark} {name}");
         let _ = writeln!(
             out,
@@ -632,16 +621,16 @@ pub fn render_changes(report: &ChangesReport) -> String {
         out,
         "{} commit{}, {} checkpoint{}",
         report.commits.len(),
-        if report.commits.len() == 1 { "" } else { "s" },
+        plural(report.commits.len()),
         report.checkpoints,
-        if report.checkpoints == 1 { "" } else { "s" }
+        plural(report.checkpoints)
     );
     let _ = writeln!(
         out,
         "{} file{} changed, {}  {}",
         report.files.len(),
-        if report.files.len() == 1 { "" } else { "s" },
-        plus_minus(&report.stats),
+        plural(report.files.len()),
+        report.stats,
         style.dim(&format!(
             "(staged {}, unstaged {}, untracked {})",
             c.staged, c.unstaged, c.untracked
@@ -650,129 +639,286 @@ pub fn render_changes(report: &ChangesReport) -> String {
     out
 }
 
-fn checkpoint_heading(cp: &crate::review::ReviewCheckpoint, style: &Style) -> String {
-    let title = cp
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("Checkpoint {}", cp.number));
-    format!("[{}] {}", cp.number, style.bold(&title))
-}
-
-fn checkpoint_meta(cp: &crate::review::ReviewCheckpoint, style: &Style, out: &mut String) {
+fn checkpoint_meta(cp: &ReviewCheckpoint, style: &Style, out: &mut String) {
     let _ = writeln!(
         out,
-        "    {} - {}  {}",
+        "      {} - {}  {}",
         local(&cp.started_at).format("%H:%M"),
         local(&cp.ended_at).format("%H:%M"),
         style.dim(&cp.id)
     );
     let _ = writeln!(
         out,
-        "    {} file{}{}  {}",
+        "      {} file{}  {}{}",
         cp.files.len(),
-        if cp.files.len() == 1 { "" } else { "s" },
-        if cp.bulk { " (bulk)" } else { "" },
-        plus_minus(&cp.stats)
+        plural(cp.files.len()),
+        cp.stats,
+        if cp.bulk { " (bulk)" } else { "" }
     );
     if let Some(note) = &cp.annotation {
-        let _ = writeln!(out, "    {}", style.dim(note));
+        let _ = writeln!(out, "      {}", style.dim(note));
     }
 }
 
-fn review_file_line(f: &crate::review::ReviewFile) -> String {
-    let mark = match f.kind {
-        ChangeKind::Created => "+",
-        ChangeKind::Modified => "~",
-        ChangeKind::Deleted => "-",
-        ChangeKind::Renamed => ">",
-    };
-    let name = match &f.from_path {
-        Some(from) => format!("{} -> {}", from.display(), f.path.display()),
-        None => f.path.display().to_string(),
-    };
-    let stat = if !f.snapshot {
-        "snapshot unavailable".to_string()
-    } else if f.binary {
-        "binary".to_string()
-    } else {
-        plus_minus(&LineStats {
-            additions: f.additions.unwrap_or(0),
-            deletions: f.deletions.unwrap_or(0),
-        })
-    };
-    format!("{mark} {name}  {stat}")
+fn file_row_line(row: &FileRow, style: &Style) -> String {
+    match row.state {
+        Some(state) => format!(
+            "{} {}  {}  {}",
+            row.mark,
+            row.name,
+            row.stat,
+            style.dim(state)
+        ),
+        None => format!("{} {}  {}", row.mark, row.name, row.stat),
+    }
 }
 
-pub fn render_review(report: &crate::review::ReviewReport) -> String {
-    let style = Style::detect();
-    let ctx = &report.repository;
-    let mut out = String::new();
-    let _ = writeln!(out);
-    let _ = writeln!(out, "{}", style.bold("Review"));
-    let _ = writeln!(out, "{}", ctx.head.label());
-    let _ = writeln!(out, "since {}", baseline_text(&ctx.since));
-    let _ = writeln!(out);
-    if report.checkpoints.is_empty() {
-        let _ = writeln!(
-            out,
-            "  {}",
-            style.dim("no recorded checkpoints in this window (run `trail start` while working)")
-        );
-        return out;
-    }
-    for cp in &report.checkpoints {
-        let _ = writeln!(out, "{}", checkpoint_heading(cp, &style));
-        checkpoint_meta(cp, &style, &mut out);
-        let _ = writeln!(out);
-        if cp.bulk {
+fn section_heading(section: &ReviewSection, style: &Style) -> String {
+    format!("[{}] {}", section.number(), style.bold(&section.heading()))
+}
+
+/// "2 checkpoints  5 files  +184 -31", plus the working tree state.
+fn section_meta(section: &ReviewSection, style: &Style, out: &mut String) {
+    let cps = section.checkpoints().len();
+    let files = section.file_rows().len();
+    match section {
+        ReviewSection::Commit(c) => {
             let _ = writeln!(
                 out,
                 "    {}",
                 style.dim(&format!(
-                    "{} files (bulk, collapsed; `trail review {}` lists them)",
-                    cp.files.len(),
-                    cp.number
+                    "{}  {}{}",
+                    c.author,
+                    local(&c.time).format("%Y-%m-%d %H:%M"),
+                    if c.is_merge {
+                        "  merge (diff vs first parent)"
+                    } else {
+                        ""
+                    }
                 ))
             );
-        } else {
-            for f in &cp.files {
-                let _ = writeln!(out, "    {}", review_file_line(f));
+            let _ = writeln!(
+                out,
+                "    {} checkpoint{}  {} file{}  {}",
+                cps,
+                plural(cps),
+                files,
+                plural(files),
+                c.stats
+            );
+        }
+        ReviewSection::WorkingTree(w) => {
+            if !w.available {
+                let _ = writeln!(
+                    out,
+                    "    {}",
+                    style.dim("worktree removed: no working tree state")
+                );
             }
+            let _ = writeln!(
+                out,
+                "    {} checkpoint{}  {} file{}  {}  {}",
+                cps,
+                plural(cps),
+                files,
+                plural(files),
+                w.stats,
+                style.dim(&format!(
+                    "(staged {}, unstaged {}, untracked {})",
+                    w.staged, w.unstaged, w.untracked
+                ))
+            );
+        }
+    }
+}
+
+fn checkpoint_line(cp: &ReviewCheckpoint, style: &Style) -> String {
+    let mut line = format!(
+        "[{}] {}  {}",
+        cp.label,
+        cp.display_title(),
+        style.dim(&cp.stats.to_string())
+    );
+    if cp.attachment == Some(Attachment::Inferred) {
+        line.push_str(&style.dim("  [inferred]"));
+    }
+    line
+}
+
+pub fn render_review(review: &WorktreeReview) -> String {
+    let style = Style::detect();
+    let ctx = &review.repository;
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Review"));
+    let worktree = if review.worktree.exists {
+        ctx.head.label()
+    } else {
+        format!("{}  {}", ctx.head.label(), style.dim("(worktree removed)"))
+    };
+    let _ = writeln!(out, "{worktree}");
+    if !review.worktree.current {
+        let _ = writeln!(
+            out,
+            "{}",
+            style.dim(&format!(
+                "worktree {}  {}",
+                review.worktree.id,
+                review.worktree.path.display()
+            ))
+        );
+    }
+    let _ = writeln!(out, "since {}", baseline_text(&ctx.since));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{RULE}");
+    let _ = writeln!(out);
+    for section in &review.sections {
+        let _ = writeln!(out, "{}", section_heading(section, &style));
+        section_meta(section, &style, &mut out);
+        let _ = writeln!(out);
+        let cps = section.checkpoints();
+        if cps.is_empty() {
+            let _ = writeln!(out, "    {}", style.dim("no recorded checkpoints"));
+        }
+        for cp in cps {
+            let _ = writeln!(out, "    {}", checkpoint_line(cp, &style));
         }
         let _ = writeln!(out);
     }
-    let _ = writeln!(out, "{SHORT_RULE}");
+    let _ = writeln!(out, "{RULE}");
+    let s = &review.summary;
     let _ = writeln!(
         out,
-        "{} checkpoint{}, {} file{}, {}",
-        report.checkpoints.len(),
-        if report.checkpoints.len() == 1 {
-            ""
-        } else {
-            "s"
-        },
-        report.files_changed,
-        if report.files_changed == 1 { "" } else { "s" },
-        plus_minus(&report.stats)
+        "{} commit{}, {} checkpoint{} ({} uncommitted), {} file{}, {}",
+        s.commits,
+        plural(s.commits),
+        s.checkpoints,
+        plural(s.checkpoints),
+        s.uncommitted_checkpoints,
+        s.files_changed,
+        plural(s.files_changed),
+        s.stats
     );
     let _ = writeln!(
         out,
         "{}",
-        style
-            .dim("trail review <n>  |  trail review <n> <file>  |  trail review <n> <file> --open")
+        style.dim("trail review <n>  |  trail review <n>.<m>  |  trail review <sel> <file> [--open]  |  trail review --commit <rev>")
     );
     out
 }
 
-pub fn render_review_checkpoint(cp: &crate::review::ReviewCheckpoint) -> String {
+/// `trail review <n>` for a commit, and `trail review --commit <rev>`.
+pub fn render_commit(c: &CommitReview) -> String {
     let style = Style::detect();
     let mut out = String::new();
     let _ = writeln!(out);
-    let _ = writeln!(out, "{}", checkpoint_heading(cp, &style));
+    let _ = writeln!(out, "{}", style.bold("Commit"));
+    let _ = writeln!(out, "[{}] {} {}", c.number, c.short_id, c.summary);
+    let _ = writeln!(
+        out,
+        "    {}",
+        style.dim(&format!(
+            "{}  {}{}",
+            c.author,
+            local(&c.time).format("%Y-%m-%d %H:%M"),
+            if c.is_merge {
+                "  merge (diff vs first parent)"
+            } else {
+                ""
+            }
+        ))
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Development path"));
+    if c.checkpoints.is_empty() {
+        let _ = writeln!(out, "    {}", style.dim("no recorded checkpoints"));
+    }
+    for cp in &c.checkpoints {
+        let _ = writeln!(out, "    {}", checkpoint_line(cp, &style));
+        checkpoint_meta(cp, &style, &mut out);
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Final commit diff"));
+    let _ = writeln!(
+        out,
+        "    {} file{}  {}",
+        c.files.len(),
+        plural(c.files.len()),
+        c.stats
+    );
+    for f in &c.files {
+        let _ = writeln!(out, "    {}", file_row_line(&f.row(), &style));
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        style.dim(&format!(
+            "trail review {} <file>  shows the commit diff of a file;  trail review {}.<m> <file>  a checkpoint's",
+            c.number, c.number
+        ))
+    );
+    out
+}
+
+/// `trail review <n>` for the working tree.
+pub fn render_working_tree(w: &WorkingTreeReview) -> String {
+    let style = Style::detect();
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Working tree"));
+    let _ = writeln!(out, "[{}]", w.number);
+    if !w.available {
+        let _ = writeln!(
+            out,
+            "    {}",
+            style.dim("worktree removed: no working tree state")
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Development path"));
+    if w.checkpoints.is_empty() {
+        let _ = writeln!(out, "    {}", style.dim("no recorded checkpoints"));
+    }
+    for cp in &w.checkpoints {
+        let _ = writeln!(out, "    {}", checkpoint_line(cp, &style));
+        checkpoint_meta(cp, &style, &mut out);
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Uncommitted changes"));
+    let _ = writeln!(
+        out,
+        "    {} file{}  {}  {}",
+        w.files.len(),
+        plural(w.files.len()),
+        w.stats,
+        style.dim(&format!(
+            "(staged {}, unstaged {}, untracked {})",
+            w.staged, w.unstaged, w.untracked
+        ))
+    );
+    for f in &w.files {
+        let _ = writeln!(out, "    {}", file_row_line(&f.row(), &style));
+    }
+    out
+}
+
+pub fn render_section(section: &ReviewSection) -> String {
+    match section {
+        ReviewSection::Commit(c) => render_commit(c),
+        ReviewSection::WorkingTree(w) => render_working_tree(w),
+    }
+}
+
+pub fn render_review_checkpoint(cp: &ReviewCheckpoint) -> String {
+    let style = Style::detect();
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", checkpoint_line(cp, &style));
     checkpoint_meta(cp, &style, &mut out);
     let _ = writeln!(out);
     for f in &cp.files {
-        let _ = writeln!(out, "    {}", review_file_line(f));
+        let _ = writeln!(out, "    {}", file_row_line(&f.row(), &style));
     }
     let _ = writeln!(out);
     let _ = writeln!(
@@ -780,35 +926,75 @@ pub fn render_review_checkpoint(cp: &crate::review::ReviewCheckpoint) -> String 
         "{}",
         style.dim(&format!(
             "trail review {} <file>  shows what this checkpoint changed in a file",
-            cp.number
+            cp.label
         ))
     );
     out
 }
 
-pub fn render_review_file(report: &crate::review::FileDiffReport) -> String {
+pub fn render_review_file(report: &FileDiffReport) -> String {
     let style = Style::detect();
-    let cp = &report.checkpoint;
-    let f = &report.file;
     let mut out = String::new();
     let _ = writeln!(
         out,
         "{}",
         style.dim(&format!(
-            "checkpoint {} ({}){}  {}",
-            cp.number,
-            cp.id,
-            cp.title
-                .as_ref()
-                .map(|t| format!(" \"{t}\""))
-                .unwrap_or_default(),
-            review_file_line(f)
+            "{}  {}",
+            report.heading,
+            file_row_line(&report.file, &Style { enabled: false })
         ))
     );
-    if !f.snapshot {
-        let _ = writeln!(out, "snapshot unavailable for this change (recorded before snapshot support, larger than the cap, or pruned)");
+    if !report.available {
+        let _ = writeln!(out, "snapshot unavailable for this change (recorded before snapshot support, larger than the cap, pruned, or the worktree was removed)");
         return out;
     }
     out.push_str(&report.diff);
+    out
+}
+
+pub fn render_worktrees(report: &WorktreesReport) -> String {
+    let style = Style::detect();
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", style.bold("Worktrees"));
+    let _ = writeln!(out, "{}", style.dim(&report.repository));
+    let _ = writeln!(out);
+    for w in &report.worktrees {
+        let mut tags = Vec::new();
+        if w.current {
+            tags.push("current");
+        }
+        if !w.exists {
+            tags.push("removed");
+        }
+        let tag = if tags.is_empty() {
+            String::new()
+        } else {
+            style.dim(&format!("  ({})", tags.join(", ")))
+        };
+        let _ = writeln!(out, "{}{tag}", style.bold(&w.id));
+        let _ = writeln!(out, "  path: {}", w.path.display());
+        let _ = writeln!(
+            out,
+            "  branch: {}",
+            w.branch.as_deref().unwrap_or("(detached)")
+        );
+        match w.commits {
+            Some(n) => {
+                let _ = writeln!(out, "  {} commit{}", n, plural(n));
+            }
+            None if w.head.is_none() => {
+                let _ = writeln!(out, "  {}", style.dim("last commit unknown"));
+            }
+            None => {}
+        }
+        let _ = writeln!(
+            out,
+            "  {} checkpoint{}",
+            w.checkpoints,
+            plural(w.checkpoints)
+        );
+        let _ = writeln!(out);
+    }
     out
 }

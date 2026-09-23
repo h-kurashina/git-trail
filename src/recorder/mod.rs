@@ -220,10 +220,7 @@ pub fn build_header(repo: &Repo, base: Option<&str>, started_at: DateTime<Utc>) 
             .unwrap_or_else(|| repo.worktree.common_dir.clone()),
         worktree_id: store::worktree_id(repo),
         worktree_path: repo.workdir().to_path_buf(),
-        branch: match &repo.head {
-            crate::git::repository::HeadState::Branch { name } => Some(name.clone()),
-            crate::git::repository::HeadState::Detached { .. } => None,
-        },
+        branch: repo.head.branch_name().map(str::to_string),
         base_commit,
         start_head: Some(repo.head_id.to_string()),
         started_at,
@@ -275,24 +272,7 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
     }
 
     if !opts.quiet {
-        println!();
-        println!("Recording development trail...");
-        println!();
-        println!("Repository");
-        println!("  {}", repo.name);
-        println!();
-        println!("Worktree");
-        println!("  {}", repo.head.label());
-        if repo.worktree.id.is_some() {
-            println!("  {}", root.display());
-        }
-        println!();
-        println!("Session");
-        println!("  {}", header.session_id);
-        println!("  {}", writer.path().display());
-        println!();
-        println!("Press Ctrl+C to stop.");
-        println!();
+        print_banner(repo, &header.session_id, writer.path());
     }
 
     let deadline = opts.stop_after.map(|d| Instant::now() + d);
@@ -321,25 +301,11 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
-
-        // Wait for the first notification, then drain everything that arrives
-        // within the batch window.
-        let mut pending: HashSet<PathBuf> = HashSet::new();
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(event) => collect_paths(event, &mut pending),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        let batch_end = Instant::now() + BATCH_WINDOW;
-        while let Some(left) = batch_end
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-        {
-            match rx.recv_timeout(left) {
-                Ok(event) => collect_paths(event, &mut pending),
-                Err(_) => break,
-            }
-        }
+        let pending = match next_batch(&rx) {
+            Batch::Paths(paths) => paths,
+            Batch::Idle => continue,
+            Batch::Closed => break,
+        };
 
         let ts = Utc::now();
         // Commit boundary: the watcher only says "something in .git moved";
@@ -412,19 +378,71 @@ pub fn run(repo: &Repo, opts: Options) -> Result<()> {
         println!(
             "Recorded {} change{} to {}",
             events,
-            if events == 1 { "" } else { "s" },
+            crate::display::plural(events),
             path.display()
         );
         if protected.is_some() {
             println!(
                 "Snapshots: {} blob{} kept under {}",
                 snapshots.blob_count(),
-                if snapshots.blob_count() == 1 { "" } else { "s" },
+                crate::display::plural(snapshots.blob_count()),
                 snapshot::ref_name(&header.session_id)
             );
         }
     }
     Ok(())
+}
+
+fn print_banner(repo: &Repo, session_id: &str, log_path: &Path) {
+    println!();
+    println!("Recording development trail...");
+    println!();
+    println!("Repository");
+    println!("  {}", repo.name);
+    println!();
+    println!("Worktree");
+    println!("  {}", repo.head.label());
+    if repo.worktree.id.is_some() {
+        println!("  {}", repo.workdir().display());
+    }
+    println!();
+    println!("Session");
+    println!("  {session_id}");
+    println!("  {}", log_path.display());
+    println!();
+    println!("Press Ctrl+C to stop.");
+    println!();
+}
+
+enum Batch {
+    /// Paths notified within one batch window.
+    Paths(HashSet<PathBuf>),
+    /// Nothing arrived; the caller re-checks its stop conditions.
+    Idle,
+    /// The watcher went away.
+    Closed,
+}
+
+/// Wait for the first notification, then drain everything that arrives
+/// within `BATCH_WINDOW`.
+fn next_batch(rx: &mpsc::Receiver<notify::Result<notify::Event>>) -> Batch {
+    let mut pending: HashSet<PathBuf> = HashSet::new();
+    match rx.recv_timeout(Duration::from_millis(200)) {
+        Ok(event) => collect_paths(event, &mut pending),
+        Err(mpsc::RecvTimeoutError::Timeout) => return Batch::Idle,
+        Err(mpsc::RecvTimeoutError::Disconnected) => return Batch::Closed,
+    }
+    let batch_end = Instant::now() + BATCH_WINDOW;
+    while let Some(left) = batch_end
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+    {
+        match rx.recv_timeout(left) {
+            Ok(event) => collect_paths(event, &mut pending),
+            Err(_) => break,
+        }
+    }
+    Batch::Paths(pending)
 }
 
 fn current_head(repo: &Repo) -> Result<String> {
