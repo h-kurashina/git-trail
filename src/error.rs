@@ -55,6 +55,9 @@ pub enum TrailError {
     #[error("{0}")]
     InvalidSelection(String),
 
+    #[error("interactive review needs a terminal\n  hint: run `trail review -i` directly, not through a pipe; `trail review` prints text")]
+    NotATerminal,
+
     #[error("snapshot unavailable: {0}")]
     SnapshotUnavailable(String),
 

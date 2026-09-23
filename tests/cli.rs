@@ -1570,3 +1570,13 @@ fn review_marks_missing_snapshots_and_respects_since_and_hidden() {
     let text = trail_ok(&f.root, &["review", "--since", "HEAD"]);
     assert!(text.contains("since commit "));
 }
+
+#[test]
+fn interactive_review_refuses_to_run_without_a_terminal() {
+    let f = Fixture::with_feature("main");
+    let out = trail(&f.root, &["review", "-i"]);
+    assert!(!out.ok);
+    assert!(out.stderr.contains("needs a terminal"), "{}", out.stderr);
+    // The text command is unaffected and still pipes.
+    assert!(trail_ok(&f.root, &["review"]).contains("Review"));
+}

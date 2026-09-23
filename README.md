@@ -34,6 +34,7 @@ trail sessions
 trail edit
 trail open src/auth/service.ts
 trail review --since push
+trail review --since push -i
 ```
 
 Global options:
@@ -327,6 +328,34 @@ the checkpoint and at its end, rebuilt from the snapshots. Git can only show
 `baseline..HEAD`; this shows each step in between. Numbers are stable for one
 `--since` window; hidden checkpoints (see `trail edit`) are skipped. Files
 recorded without snapshots are listed as `snapshot unavailable`.
+
+### `trail review -i`
+
+The same review as an interactive browser. Wide terminals show three panes
+(checkpoints, files, diff); narrow ones show one level at a time and step
+through them.
+
+```text
+┌ Checkpoints ────────┬ Files  [2] ───────────┬ Diff  src/auth/service.ts ─┐
+│  [1] Auth foundation│ > ~ src/auth/service.ts│ @@ -12,7 +12,9 @@          │
+│ >[2] API integration│   ~ src/routes/auth.ts │ -  return session;         │
+│  [3] Tests          │                        │ +  return validate(session)│
+└─────────────────────┴────────────────────────┴────────────────────────────┘
+```
+
+| key | action |
+|---|---|
+| `j` / `k`, arrows | move (scroll in the diff) |
+| `Enter` | into files, then into the diff |
+| `d` | diff of the selected file |
+| `o` | open the file as it was at the end of the checkpoint in `$VISUAL` / `$EDITOR`, then return |
+| `h` / `Esc` | back one level |
+| `q` | quit |
+
+The browser holds no review logic of its own: it shows the same review model
+as the text and JSON output, and `o` uses the same code path as
+`trail open --at`. `trail review` without `-i` keeps printing text, so it
+still pipes.
 
 ### Snapshots
 
