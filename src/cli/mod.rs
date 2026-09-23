@@ -36,18 +36,31 @@ pub enum Command {
     Status,
     /// Show what changed since the last push (or upstream, or base)
     Changes,
-    /// Review the trail checkpoint by checkpoint, with per-checkpoint diffs
+    /// Review how the worktree came to be: commits, their checkpoints, diffs
+    ///
+    /// Selectors: `2` is the second section (a commit, or the working tree,
+    /// which is always last); `2.3` is the third checkpoint that led to it.
+    /// Checkpoint ids and commit id prefixes work too.
+    #[command(verbatim_doc_comment)]
     Review {
-        /// Checkpoint number (from `trail review`) or id
-        checkpoint: Option<String>,
-        /// File within the checkpoint: prints the diff this checkpoint made
+        /// Section number (a commit or the working tree), checkpoint label
+        /// (<section>.<n>), checkpoint id or commit id
+        selector: Option<String>,
+        /// File within the selection: prints the diff it made to that file
         file: Option<PathBuf>,
-        /// Open the file as it was at the end of the checkpoint in $VISUAL / $EDITOR
+        /// Open the file as it was at the end of the selection in $VISUAL / $EDITOR
         #[arg(long)]
         open: bool,
-        /// Browse checkpoints, files and diffs interactively
+        /// Browse commits, checkpoints, files and diffs interactively
         #[arg(short = 'i', long)]
         interactive: bool,
+        /// Review one commit: its development path and its diff. A file may
+        /// follow (`trail review --commit <rev> <file>`)
+        #[arg(long, value_name = "REV")]
+        commit: Option<String>,
+        /// Review another worktree (id or branch), including removed ones
+        #[arg(long, value_name = "ID|BRANCH")]
+        worktree: Option<String>,
     },
     /// Show the development trail in detail (commits, reflog, working tree)
     History {
@@ -66,7 +79,9 @@ pub enum Command {
         #[arg(long)]
         quiet: bool,
     },
-    /// List recorded development sessions (including removed worktrees)
+    /// List worktrees of the repository, including removed ones with history
+    Worktrees,
+    /// List raw recorded sessions (debugging; `trail worktrees` is the overview)
     Sessions,
     /// Edit checkpoint titles, notes, grouping and order in $VISUAL / $EDITOR
     Edit {

@@ -35,6 +35,9 @@ trail edit
 trail open src/auth/service.ts
 trail review --since push
 trail review --since push -i
+trail review --commit a82fbc1
+trail review --worktree agent-wt
+trail worktrees
 ```
 
 Global options:
@@ -48,9 +51,9 @@ trail -C path/to/repo  # run against another directory
 
 ### `trail`
 
-Shows the Development Trail of the current branch: commits since it diverged
-from the base branch, followed by the changes still sitting in the working tree,
-in chronological order.
+Shows the Development Trail of the current worktree: commits since it
+diverged from the base branch, followed by the changes still sitting in the
+working tree, in chronological order.
 
 ```text
 Development Trail
@@ -59,11 +62,20 @@ Development Trail
 Repository
   my-project
 
-Branch
+Worktree
   feature/auth
 
 Base
   main
+
+Commits
+  1
+
+Working tree
+  2 checkpoints
+
+Development history
+  5 checkpoints
 
 2026-09-22
 12:31  Committed a82fbc1 Add authentication service (2 files)
@@ -290,13 +302,26 @@ to stdout instead. Checkpoint ids are shown by `trail history`.
 
 ### `trail review`
 
-Reads the changes checkpoint by checkpoint instead of as one final diff.
+Reads how the worktree came to be: commit by commit, and inside each commit
+checkpoint by checkpoint. A checkpoint says how something was made; a commit
+says what was confirmed. trail shows both.
+
+```text
+Worktree
+  Commit / Working tree     what was confirmed (or not yet)
+    Checkpoint              how it was made
+      File → diff
+```
 
 ```bash
-trail review --since push          # numbered checkpoints in reading order
-trail review 2                     # files of checkpoint 2
-trail review 2 src/auth/service.ts # what checkpoint 2 changed in that file
-trail review 2 src/auth/service.ts --open   # the file at the end of checkpoint 2
+trail review --since push          # sections: commits, then the working tree
+trail review 2                     # one commit: development path + final diff
+trail review 2.1                   # one checkpoint: its files
+trail review 2 src/auth/service.ts     # commit diff of a file (parent → commit)
+trail review 2.1 src/auth/service.ts   # checkpoint diff (before → after)
+trail review 2.1 src/auth/service.ts --open   # the file at the end of the checkpoint
+trail review 3 src/auth/service.ts     # working tree diff (HEAD → disk)
+trail review --commit a82fbc1      # any commit, also outside the window
 ```
 
 ```text
@@ -304,58 +329,128 @@ Review
 feature/auth
 since last push to origin/feature/auth (8fa19d2)
 
-[1] Authentication foundation
-    13:04 - 13:10  01K5V9W4YV7A3ZK6QH0M8R2B4C.1
-    3 files  +91 -12
+────────────────────────────────────
 
-    + src/auth/service.ts  +58
-    + src/session/store.ts  +31
-    ~ src/db/schema.ts  +2 -12
+[1] a82fbc1 Add authentication model
+    Hinata  2026-09-22 13:10
+    2 checkpoints  5 files  +184 -31
 
-[2] API integration
-    13:11 - 13:18  01K5V9W4YV7A3ZK6QH0M8R2B4C.2
-    2 files  +43 -16
+    [1.1] Schema and domain model  +91 -12
+    [1.2] Service integration  +93 -19
 
-    ~ src/routes/auth.ts  +18 -4
-    ~ src/auth/service.ts  +25 -12
+[2] c19e712 Add auth API
+    Hinata  2026-09-22 13:40
+    0 checkpoints  4 files  +121 -44
 
-────────────────────
-2 checkpoints, 4 files, +134 -28
+    no recorded checkpoints
+
+[3] Working tree
+    1 checkpoint  2 files  +23 -4  (staged 0, unstaged 1, untracked 1)
+
+    [3.1] Checkpoint 3.1  +23 -4
+
+────────────────────────────────────
+2 commits, 3 checkpoints (1 uncommitted), 11 files, +328 -79
 ```
 
-The per-file view is a unified diff between the file's content just before
-the checkpoint and at its end, rebuilt from the snapshots. Git can only show
-`baseline..HEAD`; this shows each step in between. Numbers are stable for one
-`--since` window; hidden checkpoints (see `trail edit`) are skipped. Files
+Sections are numbered, checkpoints are `<section>.<n>`. A commit made while
+the recorder was not running, or before any session, simply has
+`no recorded checkpoints`: git facts are never turned into checkpoints.
+
+**Which commit a checkpoint belongs to.** The recorder writes a `commit`
+record whenever HEAD moves. A checkpoint is attached to
+
+1. the commit the recorder watched being made (HEAD moved from its parent
+   to it): `recorded`;
+2. otherwise, when that commit was amended or rebased since, the reviewed
+   commit with the same author time (and summary or parent): `inferred`;
+3. otherwise the first reviewed commit created after the checkpoint ended,
+   which covers commits made while the recorder was stopped: `inferred`;
+4. otherwise the working tree.
+
+`--json` carries `attachment` on every checkpoint, and inferred ones are
+tagged `[inferred]` in the text. A checkout or reset moves HEAD too, but is
+not a commit and never claims a checkpoint.
+
+**Commit diff and checkpoint diff are different things.** A checkpoint diff
+is `before checkpoint → after checkpoint`, rebuilt from snapshots. A commit
+diff is `parent tree → commit tree`, computed from git objects; for a merge
+it is the diff against the first parent, and the output says so. Files
 recorded without snapshots are listed as `snapshot unavailable`.
+
+The JSON output is version 2: a `sections` list (`commit` or
+`working_tree`), each with its `checkpoints` and `files`, plus a `summary`.
+The version 1 fields (`checkpoints` as a flat list, `files_changed`,
+`stats`) are still present.
 
 ### `trail review -i`
 
 The same review as an interactive browser. Wide terminals show three panes
-(checkpoints, files, diff); narrow ones show one level at a time and step
-through them.
+(Development, Files, Diff); narrow ones show one level at a time and step
+through them. The state machine is the same in both, only the layout
+differs.
 
 ```text
-┌ Checkpoints ────────┬ Files  [2] ───────────┬ Diff  src/auth/service.ts ─┐
-│  [1] Auth foundation│ > ~ src/auth/service.ts│ @@ -12,7 +12,9 @@          │
-│ >[2] API integration│   ~ src/routes/auth.ts │ -  return session;         │
-│  [3] Tests          │                        │ +  return validate(session)│
-└─────────────────────┴────────────────────────┴────────────────────────────┘
+┌ Development ────────────────┬ Files  [1.2] ────────┬ Diff  src/auth/service.ts ─┐
+│ ▼ [1] a82fbc1 Add model     │ > ~ src/auth/service │ @@ -12,7 +12,9 @@          │
+│   ├ [1.1] Schema            │   ~ src/routes/auth  │ -  return session;         │
+│ > └ [1.2] Service integ.    │                      │ +  return validate(session)│
+│ ▼ [2] c19e712 Add auth API  │                      │                            │
+│ ▼ [3] Working tree          │                      │                            │
+│   └ [3.1] Checkpoint 3.1    │                      │                            │
+└─────────────────────────────┴──────────────────────┴────────────────────────────┘
 ```
 
 | key | action |
 |---|---|
 | `j` / `k`, arrows | move (scroll in the diff) |
-| `Enter` | into files, then into the diff |
-| `d` | diff of the selected file |
-| `o` | open the file as it was at the end of the checkpoint in `$VISUAL` / `$EDITOR`, then return |
-| `h` / `Esc` | back one level |
+| `Enter` | expand a collapsed commit; otherwise into files, then into the diff |
+| `d` | diff of the selection: a commit, a checkpoint, or a file |
+| `c` | commit diff of the commit the selection belongs to |
+| `o` | open the selected file: at the end of the checkpoint, as committed, or in the worktree |
+| `h` / `Esc` | back one level; on the tree, collapse or jump to the commit |
 | `q` | quit |
 
-The browser holds no review logic of its own: it shows the same review model
-as the text and JSON output, and `o` uses the same code path as
-`trail open --at`. `trail review` without `-i` keeps printing text, so it
-still pipes.
+The browser holds no review logic of its own: it shows the same model as
+the text and JSON output and asks the review module for diffs.
+
+### `trail worktrees`
+
+Every worktree of the repository: the ones git has, and the ones that were
+removed but left recorded history under the common git dir.
+
+```text
+Worktrees
+my-project
+
+main  (current)
+  path: /Users/…/my-project
+  branch: main
+  0 commits
+  0 checkpoints
+
+agent-wt  (removed)
+  path: /Users/…/my-project-agent
+  branch: agent/payments
+  4 commits
+  11 checkpoints
+```
+
+### `trail review --worktree <id|branch>`
+
+Reviews another worktree, by its id (the directory name under
+`.git/worktrees/`, or `main`) or its branch. A branch checked out in two
+worktrees, or reused after a worktree was removed, is ambiguous and an
+error; the id always works.
+
+A removed worktree is rebuilt from what is left: its commits (the branch
+ref, or the last HEAD its sessions recorded), its checkpoints, the metadata
+overlay and the snapshots. The working tree section is marked as
+unavailable, since nothing on disk can be read any more; checkpoint and
+commit diffs still work.
+
+Sessions remain the recorder's storage unit (`trail sessions` lists them
+raw), but the review is about worktrees, commits and checkpoints.
 
 ### Snapshots
 

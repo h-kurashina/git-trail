@@ -170,6 +170,35 @@ impl LineStats {
         self.additions += stat.additions.unwrap_or(0);
         self.deletions += stat.deletions.unwrap_or(0);
     }
+
+    /// Sum of several per-file stats.
+    pub fn sum<'a>(stats: impl IntoIterator<Item = &'a FileStat>) -> Self {
+        let mut total = LineStats::default();
+        for s in stats {
+            total.add(s);
+        }
+        total
+    }
+
+    /// From optional per-side counts (binary files count as zero).
+    pub fn from_counts(additions: Option<u64>, deletions: Option<u64>) -> Self {
+        LineStats {
+            additions: additions.unwrap_or(0),
+            deletions: deletions.unwrap_or(0),
+        }
+    }
+}
+
+/// `+3 -1`, `+3`, `-1` or `±0`: the notation every text view uses.
+impl std::fmt::Display for LineStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.additions, self.deletions) {
+            (0, 0) => write!(f, "±0"),
+            (a, 0) => write!(f, "+{a}"),
+            (0, d) => write!(f, "-{d}"),
+            (a, d) => write!(f, "+{a} -{d}"),
+        }
+    }
 }
 
 /// Parse `git diff --numstat -z` output (with `-M`, renames appear as
@@ -208,22 +237,11 @@ pub fn parse_numstat(bytes: &[u8]) -> Vec<FileStat> {
     stats
 }
 
-/// What to compare the working tree (or index) against.
-#[derive(Debug, Clone, Copy)]
-pub enum DiffTarget<'a> {
-    /// `rev` vs working tree (tracked files only).
-    Revision(&'a str),
-    // Future: Staged (HEAD vs index) and Unstaged (index vs worktree) when a
-    // command needs the two sides separately.
-}
-
-/// `git diff --numstat` for tracked files. Untracked files are handled by
-/// [`untracked_stats`] because git does not include them in a diff.
-pub fn numstat(workdir: &Path, target: DiffTarget<'_>, paths: &[&Path]) -> Result<Vec<FileStat>> {
-    let mut args: Vec<&str> = vec!["diff", "--numstat", "-z", "-M"];
-    match target {
-        DiffTarget::Revision(rev) => args.push(rev),
-    }
+/// `git diff --numstat` of `rev` against the working tree, for tracked files.
+/// Untracked files are handled by [`untracked_stats`] because git does not
+/// include them in a diff.
+pub fn numstat(workdir: &Path, rev: &str, paths: &[&Path]) -> Result<Vec<FileStat>> {
+    let mut args: Vec<&str> = vec!["diff", "--numstat", "-z", "-M", rev];
     let path_strs: Vec<String> = paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -234,6 +252,16 @@ pub fn numstat(workdir: &Path, target: DiffTarget<'_>, paths: &[&Path]) -> Resul
     }
     let out = run_git(workdir, &args)?;
     Ok(parse_numstat(&out))
+}
+
+/// Unified diff of one tracked file, `rev` against the working tree.
+pub fn unified(workdir: &Path, rev: &str, path: &Path) -> Result<String> {
+    let path = path.to_string_lossy();
+    let out = run_git(
+        workdir,
+        &["diff", "--no-color", "--no-ext-diff", rev, "--", &path],
+    )?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Count lines of untracked files so they can join the totals as pure additions.

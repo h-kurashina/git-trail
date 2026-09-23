@@ -6,6 +6,7 @@ use gix::bstr::ByteSlice;
 use serde::Serialize;
 
 use crate::error::{Result, TrailError};
+use crate::git::normalize_path;
 use crate::git::worktree::WorktreeInfo;
 
 /// State of HEAD as far as trail cares.
@@ -17,6 +18,14 @@ pub enum HeadState {
 }
 
 impl HeadState {
+    /// Branch name, `None` on a detached HEAD.
+    pub fn branch_name(&self) -> Option<&str> {
+        match self {
+            HeadState::Branch { name } => Some(name),
+            HeadState::Detached { .. } => None,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             HeadState::Branch { name } => name.clone(),
@@ -51,9 +60,11 @@ pub struct Repo {
     pub name: String,
     pub worktree: WorktreeInfo,
     pub head: HeadState,
-    #[allow(dead_code)]
     pub head_id: gix::ObjectId,
     pub is_shallow: bool,
+    /// False for a worktree that was removed: the object database and the
+    /// recorded history are there, the working tree is not.
+    pub live: bool,
 }
 
 impl Repo {
@@ -106,7 +117,98 @@ impl Repo {
             head,
             head_id,
             is_shallow,
+            live: true,
         })
+    }
+
+    /// A view of a linked worktree that no longer exists on disk. Git
+    /// objects, refs and trail's recorded history are shared through the
+    /// common dir, so everything except the working tree state is available.
+    pub fn for_removed_worktree(
+        &self,
+        id: &str,
+        recorded_path: &Path,
+        branch: Option<&str>,
+        head_id: gix::ObjectId,
+    ) -> Repo {
+        let common_dir = self.worktree.common_dir.clone();
+        Repo {
+            inner: self.inner.clone(),
+            name: self.name.clone(),
+            worktree: WorktreeInfo {
+                root: recorded_path.to_path_buf(),
+                git_dir: common_dir.join("worktrees").join(id),
+                common_dir,
+                kind: crate::git::worktree::WorktreeKind::Linked,
+                id: Some(id.to_string()),
+                sibling_count: self.worktree.sibling_count,
+            },
+            head: match branch {
+                Some(name) => HeadState::Branch { name: name.into() },
+                None => HeadState::Detached {
+                    short_id: short_id(&self.inner, &head_id),
+                },
+            },
+            head_id,
+            is_shallow: self.is_shallow,
+            live: false,
+        }
+    }
+
+    /// A second handle to the same worktree.
+    pub fn clone_handle(&self) -> Repo {
+        Repo {
+            inner: self.inner.clone(),
+            name: self.name.clone(),
+            worktree: self.worktree.clone(),
+            head: self.head.clone(),
+            head_id: self.head_id,
+            is_shallow: self.is_shallow,
+            live: self.live,
+        }
+    }
+
+    /// Identifier of this worktree inside the trail store: the linked
+    /// worktree's id under `.git/worktrees/`, or `main`.
+    pub fn worktree_id(&self) -> String {
+        self.worktree.id.clone().unwrap_or_else(|| "main".into())
+    }
+
+    /// True when `ancestor` is reachable from `descendant` (or equal).
+    /// Unknown or garbage collected objects are not ancestors.
+    pub fn is_ancestor(&self, ancestor: gix::ObjectId, descendant: gix::ObjectId) -> bool {
+        if ancestor == descendant {
+            return true;
+        }
+        match self.inner.merge_base(descendant, ancestor) {
+            Ok(base) => base.detach() == ancestor,
+            Err(_) => false,
+        }
+    }
+
+    /// Resolve a revision expression to a commit id.
+    pub fn rev_parse(&self, rev: &str) -> Result<gix::ObjectId> {
+        self.inner
+            .rev_parse_single(rev.as_bytes())
+            .map(|id| id.detach())
+            .map_err(|_| TrailError::InvalidSelection(format!("'{rev}' is not a known revision")))
+    }
+
+    /// `git status`, or nothing for a removed worktree.
+    pub fn status(&self) -> Result<Vec<crate::git::diff::StatusEntry>> {
+        if !self.live {
+            return Ok(Vec::new());
+        }
+        crate::git::diff::status(self.workdir())
+    }
+
+    /// `git diff --numstat <rev>` against the working tree, or nothing for a
+    /// removed worktree.
+    pub fn numstat(&self, rev: &str, paths: &[&Path]) -> Result<Vec<crate::git::diff::FileStat>> {
+        if !self.live {
+            return Ok(Vec::new());
+        }
+        crate::git::diff::numstat(self.workdir(), rev, paths)
     }
 
     pub fn gix(&self) -> &gix::Repository {
@@ -205,13 +307,13 @@ impl Repo {
         } else {
             cwd.join(file)
         };
-        let absolute = lexically_normalize(&absolute);
-        let root = lexically_normalize(self.workdir());
+        let absolute = normalize_path(&absolute);
+        let root = normalize_path(self.workdir());
         match absolute.strip_prefix(&root) {
             Ok(rel) => Ok(rel.to_path_buf()),
             // Outside the worktree as given: assume the user typed a path
             // relative to the repository root.
-            Err(_) => Ok(lexically_normalize(file)),
+            Err(_) => Ok(normalize_path(file)),
         }
     }
 }
@@ -234,19 +336,4 @@ fn repo_name(common_dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().trim_end_matches(".git").to_string())
         .unwrap_or_else(|| "repository".into())
-}
-
-/// Resolve `.` and `..` without touching the filesystem (symlinks are left alone).
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
