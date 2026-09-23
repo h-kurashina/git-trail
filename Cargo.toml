@@ -1,10 +1,10 @@
 [package]
-name = "trail"
+name = "git-trail"
 version = "0.1.0"
 edition = "2021"
 description = "Understand how your code changed, not just what changed. A local-first CLI that reconstructs the development history of a Git worktree."
 license = "MIT"
-repository = "https://github.com/example/trail"
+repository = "https://github.com/h-kurashina/trail"
 readme = "README.md"
 keywords = ["git", "cli", "history", "worktree", "diff"]
 categories = ["command-line-utilities", "development-tools"]
