@@ -7,7 +7,7 @@ trail is a local-first CLI that reconstructs the development history of a Git wo
 ## Install
 
 ```bash
-cargo install trail
+cargo install git-trail
 ```
 
 Or from source:
